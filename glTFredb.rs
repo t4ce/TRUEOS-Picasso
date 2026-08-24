@@ -13,6 +13,7 @@ use thiserror::Error;
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("picasso_meta_v1");
 const RECORDS: TableDefinition<&str, &[u8]> = TableDefinition::new("picasso_records_v1");
 const BLOBS: TableDefinition<&str, &[u8]> = TableDefinition::new("picasso_blob_chunks_v1");
+const TRACKING: TableDefinition<&str, &[u8]> = TableDefinition::new("picasso_tracking_v1");
 const CHUNK: usize = 64 * 1024;
 
 #[derive(Debug, Error)]
@@ -47,6 +48,10 @@ pub enum Error {
     },
     #[error("no published revision {0}")]
     UnknownRevision(u64),
+    #[error("no normalized record `{0}`")]
+    UnknownRecord(String),
+    #[error("a record must be included before it can be respected or tested")]
+    InvalidTrackingState,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -55,6 +60,15 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub enum RevisionState {
     Staging,
     Complete,
+}
+
+/// Mutable bare-metal implementation status, deliberately kept outside the
+/// immutable imported record.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Tracking {
+    pub included: bool,
+    pub fully_respected: bool,
+    pub tested: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -322,8 +336,60 @@ impl Store {
             },
         )?;
         drop(records);
+        seed_tracking_for_revision(&write, revision_id, &asset_key)?;
         write.commit()?;
         Ok(revision_id)
+    }
+
+    /// Adds false tracking entries for every normalized record that predates
+    /// the tracking overlay. Existing tracking decisions are preserved.
+    pub fn initialize_tracking(&self) -> Result<usize> {
+        let write = self.db.begin_write()?;
+        let keys = {
+            let records = write.open_table(RECORDS)?;
+            let mut keys = Vec::new();
+            for entry in records.iter()? {
+                let (key, _) = entry?;
+                keys.push(key.value().to_owned());
+            }
+            keys
+        };
+        let inserted = insert_missing_tracking(&write, keys)?;
+        write.commit()?;
+        Ok(inserted)
+    }
+
+    pub fn tracking(&self, record_id: &str) -> Result<Option<Tracking>> {
+        let read = self.db.begin_read()?;
+        let table = match read.open_table(TRACKING) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        table
+            .get(record_id)?
+            .map(|value| decode(value.value()))
+            .transpose()
+    }
+
+    /// Updates implementation status without mutating the imported asset.
+    pub fn set_tracking(&self, record_id: &str, tracking: Tracking) -> Result<()> {
+        if (tracking.fully_respected || tracking.tested) && !tracking.included {
+            return Err(Error::InvalidTrackingState);
+        }
+        let write = self.db.begin_write()?;
+        {
+            let records = write.open_table(RECORDS)?;
+            if records.get(record_id)?.is_none() {
+                return Err(Error::UnknownRecord(record_id.to_owned()));
+            }
+        }
+        {
+            let mut table = write.open_table(TRACKING)?;
+            table.insert(record_id, encode(&tracking)?.as_slice())?;
+        }
+        write.commit()?;
+        Ok(())
     }
     pub fn revision(&self, id: u64) -> Result<Revision> {
         let read = self.db.begin_read()?;
@@ -412,6 +478,40 @@ fn put_blob(write: &redb::WriteTransaction, id: &str, bytes: &[u8]) -> Result<()
     Ok(())
 }
 
+fn seed_tracking_for_revision(
+    write: &redb::WriteTransaction,
+    revision_id: u64,
+    asset_key: &str,
+) -> Result<()> {
+    let prefix = format!("r/{revision_id}/");
+    let keys = {
+        let records = write.open_table(RECORDS)?;
+        let mut keys = vec![asset_key.to_owned()];
+        for entry in records.iter()? {
+            let (key, _) = entry?;
+            if key.value().starts_with(&prefix) {
+                keys.push(key.value().to_owned());
+            }
+        }
+        keys
+    };
+    insert_missing_tracking(write, keys)?;
+    Ok(())
+}
+
+fn insert_missing_tracking(write: &redb::WriteTransaction, keys: Vec<String>) -> Result<usize> {
+    let mut tracking = write.open_table(TRACKING)?;
+    let default = encode(&Tracking::default())?;
+    let mut inserted = 0;
+    for key in keys {
+        if tracking.get(key.as_str())?.is_none() {
+            tracking.insert(key.as_str(), default.as_slice())?;
+            inserted += 1;
+        }
+    }
+    Ok(inserted)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -457,6 +557,35 @@ mod tests {
             .is_err()
         );
         assert!(s.revision(1).is_err());
+        let _ = fs::remove_file(p);
+    }
+
+    #[test]
+    fn tracking_starts_false_and_respects_progression() {
+        let p = std::env::temp_dir().join(format!("picasso-t-{}", std::process::id()));
+        let _ = fs::remove_file(&p);
+        let s = Store::create(&p).unwrap();
+        let revision = s.import("tracked", &json(), &BTreeMap::new()).unwrap();
+        let node = eid(revision, "node", 0);
+        assert_eq!(s.tracking(&node).unwrap(), Some(Tracking::default()));
+        assert!(
+            s.set_tracking(
+                &node,
+                Tracking {
+                    included: false,
+                    fully_respected: true,
+                    tested: false,
+                }
+            )
+            .is_err()
+        );
+        let progressed = Tracking {
+            included: true,
+            fully_respected: false,
+            tested: true,
+        };
+        s.set_tracking(&node, progressed).unwrap();
+        assert_eq!(s.tracking(&node).unwrap(), Some(progressed));
         let _ = fs::remove_file(p);
     }
 }
