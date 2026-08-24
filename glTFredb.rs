@@ -3,12 +3,14 @@
 //! A collection is deliberately absent here: glTF nodes describe transform
 //! hierarchy, while collections are an editor concern and must not imply parentage.
 
+#[path = "MASS.rs"]
+pub mod mass;
+
 use std::{collections::BTreeMap, path::Path};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
 
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("picasso_meta_v1");
 const RECORDS: TableDefinition<&str, &[u8]> = TableDefinition::new("picasso_records_v1");
@@ -16,43 +18,81 @@ const BLOBS: TableDefinition<&str, &[u8]> = TableDefinition::new("picasso_blob_c
 const TRACKING: TableDefinition<&str, &[u8]> = TableDefinition::new("picasso_tracking_v1");
 const CHUNK: usize = 64 * 1024;
 
-#[derive(Debug, Error)]
+#[derive(Debug)]
 pub enum Error {
-    #[error("database: {0}")]
-    Database(#[from] redb::Error),
-    #[error("database open: {0}")]
-    DatabaseOpen(#[from] redb::DatabaseError),
-    #[error("database transaction: {0}")]
-    Transaction(#[from] redb::TransactionError),
-    #[error("database table: {0}")]
-    Table(#[from] redb::TableError),
-    #[error("database storage: {0}")]
-    Storage(#[from] redb::StorageError),
-    #[error("database commit: {0}")]
-    Commit(#[from] redb::CommitError),
-    #[error("io: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("invalid glTF: {0}")]
-    Gltf(#[from] gltf::Error),
-    #[error("invalid record encoding: {0}")]
-    Json(#[from] serde_json::Error),
-    #[error("missing payload for external buffer `{0}`")]
+    Database(redb::Error),
+    DatabaseOpen(redb::DatabaseError),
+    Transaction(redb::TransactionError),
+    Table(redb::TableError),
+    Storage(redb::StorageError),
+    Commit(redb::CommitError),
+    Io(std::io::Error),
+    Gltf(gltf::Error),
+    Json(serde_json::Error),
     MissingBuffer(String),
-    #[error("invalid data URI")]
     DataUri,
-    #[error("buffer {index} is {actual} bytes; glTF declares {declared}")]
     BufferLength {
         index: usize,
         actual: usize,
         declared: usize,
     },
-    #[error("no published revision {0}")]
     UnknownRevision(u64),
-    #[error("no normalized record `{0}`")]
     UnknownRecord(String),
-    #[error("a record must be included before it can be respected or tested")]
     InvalidTrackingState,
 }
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Database(e) => write!(f, "database: {e}"),
+            Self::DatabaseOpen(e) => write!(f, "database open: {e}"),
+            Self::Transaction(e) => write!(f, "database transaction: {e}"),
+            Self::Table(e) => write!(f, "database table: {e}"),
+            Self::Storage(e) => write!(f, "database storage: {e}"),
+            Self::Commit(e) => write!(f, "database commit: {e}"),
+            Self::Io(e) => write!(f, "io: {e}"),
+            Self::Gltf(e) => write!(f, "invalid glTF: {e}"),
+            Self::Json(e) => write!(f, "invalid record encoding: {e}"),
+            Self::MissingBuffer(uri) => write!(f, "missing payload for external buffer `{uri}`"),
+            Self::DataUri => f.write_str("invalid data URI"),
+            Self::BufferLength {
+                index,
+                actual,
+                declared,
+            } => write!(
+                f,
+                "buffer {index} is {actual} bytes; glTF declares {declared}"
+            ),
+            Self::UnknownRevision(id) => write!(f, "no published revision {id}"),
+            Self::UnknownRecord(id) => write!(f, "no normalized record `{id}`"),
+            Self::InvalidTrackingState => {
+                f.write_str("a record must be included before it can be respected or tested")
+            }
+        }
+    }
+}
+
+impl std::error::Error for Error {}
+
+macro_rules! error_from {
+    ($source:ty, $variant:ident) => {
+        impl From<$source> for Error {
+            fn from(error: $source) -> Self {
+                Self::$variant(error)
+            }
+        }
+    };
+}
+
+error_from!(redb::Error, Database);
+error_from!(redb::DatabaseError, DatabaseOpen);
+error_from!(redb::TransactionError, Transaction);
+error_from!(redb::TableError, Table);
+error_from!(redb::StorageError, Storage);
+error_from!(redb::CommitError, Commit);
+error_from!(std::io::Error, Io);
+error_from!(gltf::Error, Gltf);
+error_from!(serde_json::Error, Json);
 
 pub type Result<T> = std::result::Result<T, Error>;
 
