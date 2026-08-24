@@ -10,19 +10,18 @@
 #[repr(transparent)]
 pub struct ResourceId(pub u64);
 
-/// GPU virtual address of shared DDR5 already mapped by the platform.
+/// Opaque identity of one live, materialized shared resource.
 ///
-/// This is intentionally only an address in the vGPU-visible allocation. It
-/// is not a GuC, PPGTT, MMIO, engine-context, or other driver-private handle.
+/// The platform resolves this to its own buffer/VM mapping. Picasso never
+/// observes the corresponding GPU virtual address or buffer handle.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(transparent)]
-pub struct GpuAddress(pub u64);
+pub struct SharedResourceId(pub u64);
 
 /// A sealed immutable byte range in a prepared resource.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PreparedRange {
     pub resource: ResourceId,
-    pub gpu_address: GpuAddress,
     pub offset: u64,
     pub byte_length: u64,
     /// Changes only when Dealer publishes a new prepared resource revision.
@@ -57,4 +56,161 @@ pub struct ExecutablePrimitive {
     pub vertex_stride: u32,
     pub vertex_count: u32,
     pub index_count: u32,
+}
+
+/// Stable index into a retained transform-state table.
+///
+/// This is deliberately not a GPU address. The executor resolves the table's
+/// [`SharedResourceId`] and bounds-checks this index before dispatch.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(transparent)]
+pub struct TransformId(pub u32);
+
+/// Scale, quaternion rotation, then translation.
+///
+/// The explicit padding gives the shared-memory form a stable 48-byte stride.
+/// Zero scale is valid: animation and topology tools may intentionally
+/// collapse selected vertices. A consumer must reject non-finite values and a
+/// zero-length quaternion before publishing work.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C, align(16))]
+pub struct TransformValue {
+    pub translation: [f32; 3],
+    pub translation_pad: f32,
+    /// Quaternion in x, y, z, w order.
+    pub rotation: [f32; 4],
+    pub scale: [f32; 3],
+    pub scale_pad: f32,
+}
+
+impl TransformValue {
+    pub const IDENTITY: Self = Self {
+        translation: [0.0; 3],
+        translation_pad: 0.0,
+        rotation: [0.0, 0.0, 0.0, 1.0],
+        scale: [1.0; 3],
+        scale_pad: 0.0,
+    };
+
+    pub fn is_valid(self) -> bool {
+        let finite = self
+            .translation
+            .into_iter()
+            .chain(self.rotation)
+            .chain(self.scale)
+            .all(f32::is_finite);
+        let norm_squared = self.rotation.into_iter().map(|v| v * v).sum::<f32>();
+        finite && norm_squared > 1.0e-12
+    }
+}
+
+impl Default for TransformValue {
+    fn default() -> Self {
+        Self::IDENTITY
+    }
+}
+
+/// Mesh-local vertices selected by one inline transform value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VertexSelection {
+    All,
+    Range {
+        first_vertex: u32,
+        vertex_count: u32,
+    },
+    /// Packed `u32` mesh-local vertex indices prepared by Dealer.
+    IndexList {
+        indices: PreparedRange,
+        index_count: u32,
+    },
+}
+
+/// One literal transform operation.
+///
+/// A worklist of these records covers the broadcast case with one `All`
+/// record, arbitrary subsets with ranges/index lists, and fully independent
+/// motion with one single-vertex record per vertex.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TransformByValue {
+    pub selection: VertexSelection,
+    pub value: TransformValue,
+}
+
+/// Mutable, retained transform states restored with a Cubism shared region.
+/// `generation` lets the GPU skip an unchanged table without consulting redb.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TransformStateRange {
+    pub resource: SharedResourceId,
+    pub offset: u64,
+    pub byte_length: u64,
+    pub state_count: u32,
+    pub state_stride: u32,
+    pub generation: u64,
+}
+
+/// Mesh-local references into a retained [`TransformStateRange`].
+///
+/// `references` contains packed `u32` [`TransformId`] values. It may contain
+/// one reference for the whole mesh, one per authored range, or one per
+/// vertex. Geometry remains immutable and is never duplicated merely because
+/// several instances or vertices select different transforms.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TransformRefList {
+    pub states: TransformStateRange,
+    pub references: PreparedRange,
+    pub reference_count: u32,
+}
+
+/// Where the common transform evaluator leaves its result.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransformExecution {
+    /// Resolve references while drawing; canonical vertices remain untouched.
+    EvaluateAtDraw,
+    /// Write a derived vertex stream from canonical source geometry.
+    Materialize,
+    /// The GPU result becomes the authoritative input of the next generation.
+    Evolve,
+}
+
+const _: () = {
+    assert!(core::mem::size_of::<TransformValue>() == 48);
+    assert!(core::mem::align_of::<TransformValue>() == 16);
+};
+
+#[cfg(test)]
+mod transform_tests {
+    use super::*;
+
+    #[test]
+    fn identity_is_valid_and_zero_scale_is_allowed() {
+        assert!(TransformValue::IDENTITY.is_valid());
+        let collapsed = TransformValue {
+            scale: [0.0; 3],
+            ..TransformValue::IDENTITY
+        };
+        assert!(collapsed.is_valid());
+    }
+
+    #[test]
+    fn transform_references_are_resource_relative() {
+        let refs = TransformRefList {
+            states: TransformStateRange {
+                resource: SharedResourceId(7),
+                offset: 64,
+                byte_length: 4 * 48,
+                state_count: 4,
+                state_stride: 48,
+                generation: 9,
+            },
+            references: PreparedRange {
+                resource: ResourceId(11),
+                offset: 0,
+                byte_length: 4 * 4,
+                revision: 1,
+            },
+            reference_count: 4,
+        };
+        assert_eq!(refs.states.resource, SharedResourceId(7));
+        assert_eq!(refs.references.byte_length, 16);
+    }
 }

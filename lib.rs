@@ -16,7 +16,7 @@ pub mod cubism;
 
 pub use cubism::{
     CoherentVisibility, CpuSlot, CubismError, DealerRingRecord, ExecRing, ExecSlotHeader,
-    PublishedSlot, VisibilityOps,
+    PublishedSlot, SharedByteRange, VisibilityOps,
 };
 
 #[cfg(feature = "host")]

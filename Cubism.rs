@@ -19,6 +19,8 @@ use core::ptr::NonNull;
 use core::slice;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 
+use crate::SharedResourceId;
+
 pub type Result<T> = core::result::Result<T, CubismError>;
 
 #[repr(u32)]
@@ -60,13 +62,36 @@ pub struct DealerRingRecord {
     pub last_checkpoint_generation: u64,
 }
 
+/// A byte range in a materialized shared resource.
+///
+/// This is deliberately resource-relative: the executor resolves `resource`
+/// privately to its buffer and GPUVM mapping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SharedByteRange {
+    pub resource: SharedResourceId,
+    pub offset: u64,
+    pub byte_length: u64,
+}
+
 /// Hardware/OS-specific CPU<->GPU visibility hooks.
 pub trait VisibilityOps {
-    /// Called after CPU payload writes, immediately before Release publication.
-    fn cpu_make_gpu_visible(&self, cpu_payload: *const u8, gpu_payload: u64, bytes: usize);
+    /// Flush slot data after CPU writes but before the ownership marker moves.
+    ///
+    /// The range starts at the slot header and includes its published payload,
+    /// so cache maintenance never makes the payload visible without the
+    /// metadata which describes it.
+    fn cpu_make_gpu_visible(&self, range: SharedByteRange) -> Result<()>;
+
+    /// Flush the header control cacheline after the Release publication store.
+    ///
+    /// This separate operation is required on non-coherent mappings: the data
+    /// flush alone happens before `sequence` becomes published.
+    fn cpu_publish_slot(&self, header: SharedByteRange) -> Result<()>;
 
     /// Called after timeline completion and before making the slot FREE again.
-    fn gpu_make_cpu_visible(&self, cpu_payload: *const u8, gpu_payload: u64, bytes: usize);
+    /// The header is CPU-owned control state; this invalidates payload bytes
+    /// only, after the CPU has read the timeline from the header.
+    fn gpu_make_cpu_visible(&self, range: SharedByteRange) -> Result<()>;
 }
 
 /// Suitable only when your actual mapping is coherent, or for bring-up/tests.
@@ -75,10 +100,19 @@ pub struct CoherentVisibility;
 
 impl VisibilityOps for CoherentVisibility {
     #[inline]
-    fn cpu_make_gpu_visible(&self, _: *const u8, _: u64, _: usize) {}
+    fn cpu_make_gpu_visible(&self, _: SharedByteRange) -> Result<()> {
+        Ok(())
+    }
 
     #[inline]
-    fn gpu_make_cpu_visible(&self, _: *const u8, _: u64, _: usize) {}
+    fn cpu_publish_slot(&self, _: SharedByteRange) -> Result<()> {
+        Ok(())
+    }
+
+    #[inline]
+    fn gpu_make_cpu_visible(&self, _: SharedByteRange) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// A live ring over preallocated shared DDR.
@@ -90,7 +124,7 @@ pub struct ExecRing {
     slot_count: usize,
     slot_stride: usize,
     payload_capacity: usize,
-    gpu_base: u64,
+    resource: SharedResourceId,
     producer_hint: AtomicU64,
 }
 
@@ -104,7 +138,7 @@ impl fmt::Debug for ExecRing {
             .field("slot_count", &self.slot_count)
             .field("slot_stride", &self.slot_stride)
             .field("payload_capacity", &self.payload_capacity)
-            .field("gpu_base", &format_args!("{:#x}", self.gpu_base))
+            .field("resource", &self.resource)
             .finish()
     }
 }
@@ -114,11 +148,12 @@ impl ExecRing {
     ///
     /// # Safety
     /// `cpu_base` must be valid, writable, 64-byte aligned, stable for the
-    /// lifetime of the ring, and correspond byte-for-byte to `gpu_base`.
+    /// lifetime of the ring, and name the CPU mapping of `resource`.
+    /// `resource` is opaque to Picasso; the platform owns its GPU mapping.
     pub unsafe fn from_raw_parts(
         cpu_base: *mut u8,
         total_bytes: usize,
-        gpu_base: u64,
+        resource: SharedResourceId,
         slot_count: usize,
         slot_stride: usize,
     ) -> Result<Self> {
@@ -152,7 +187,7 @@ impl ExecRing {
             slot_count,
             slot_stride,
             payload_capacity: slot_stride - size_of::<ExecSlotHeader>(),
-            gpu_base,
+            resource,
             producer_hint: AtomicU64::new(0),
         })
     }
@@ -286,10 +321,7 @@ impl ExecRing {
         }
 
         let bytes = h.payload_bytes.load(Ordering::Acquire) as usize;
-        let cpu_payload = self.payload_ptr(index);
-        let gpu_payload = self.gpu_payload_address(index);
-
-        visibility.gpu_make_cpu_visible(cpu_payload.cast_const(), gpu_payload, bytes);
+        visibility.gpu_make_cpu_visible(self.payload_range(index, bytes)?)?;
         fence(Ordering::Release);
 
         h.debug_state
@@ -311,8 +343,36 @@ impl ExecRing {
     }
 
     #[inline]
-    pub fn gpu_payload_address(&self, index: usize) -> u64 {
-        self.gpu_base + (index * self.slot_stride + size_of::<ExecSlotHeader>()) as u64
+    pub fn resource(&self) -> SharedResourceId {
+        self.resource
+    }
+
+    /// Header plus `payload_bytes`, suitable for one coherent cache operation.
+    fn slot_range(&self, index: usize, payload_bytes: usize) -> Result<SharedByteRange> {
+        self.validate_index(index)?;
+        let byte_length = size_of::<ExecSlotHeader>()
+            .checked_add(payload_bytes)
+            .ok_or(CubismError::SizeOverflow)?;
+        Ok(SharedByteRange {
+            resource: self.resource,
+            offset: (index * self.slot_stride) as u64,
+            byte_length: byte_length as u64,
+        })
+    }
+
+    #[inline]
+    fn header_range(&self, index: usize) -> Result<SharedByteRange> {
+        self.slot_range(index, 0)
+    }
+
+    #[inline]
+    fn payload_range(&self, index: usize, payload_bytes: usize) -> Result<SharedByteRange> {
+        self.validate_index(index)?;
+        Ok(SharedByteRange {
+            resource: self.resource,
+            offset: (index * self.slot_stride + size_of::<ExecSlotHeader>()) as u64,
+            byte_length: payload_bytes as u64,
+        })
     }
 
     #[inline]
@@ -401,20 +461,18 @@ impl<'a> CpuSlot<'a> {
             .store(resource_revision, Ordering::Relaxed);
         h.gpu_timeline.store(0, Ordering::Relaxed);
 
-        let cpu_payload = self.ring.payload_ptr(self.index);
-        let gpu_payload = self.ring.gpu_payload_address(self.index);
-
-        visibility.cpu_make_gpu_visible(
-            cpu_payload.cast_const(),
-            gpu_payload,
-            payload_bytes as usize,
-        );
+        visibility
+            .cpu_make_gpu_visible(self.ring.slot_range(self.index, payload_bytes as usize)?)?;
 
         fence(Ordering::Release);
         h.debug_state
             .store(DebugState::CpuSealed as u32, Ordering::Relaxed);
         h.sequence
             .store(published_sequence(self.generation)?, Ordering::Release);
+        // The ownership marker was written after the data flush. Flush its
+        // cacheline separately so a non-coherent GPU cannot observe stale
+        // `sequence` after seeing the payload.
+        visibility.cpu_publish_slot(self.ring.header_range(self.index)?)?;
 
         self.published = true;
 
@@ -462,8 +520,12 @@ impl<'a> PublishedSlot<'a> {
     }
 
     #[inline]
-    pub fn gpu_address(&self) -> u64 {
-        self.ring.gpu_payload_address(self.index)
+    pub fn payload_range(&self) -> SharedByteRange {
+        // Index and payload length were established by this exact published
+        // generation, so construction cannot fail here.
+        self.ring
+            .payload_range(self.index, self.payload_bytes() as usize)
+            .expect("published slot is always in range")
     }
 
     #[inline]
@@ -550,6 +612,7 @@ pub enum CubismError {
     NotSubmitted,
     GenerationMismatch { expected: u64, actual: u64 },
     TimelineNotComplete { submitted: u64, completed: u64 },
+    VisibilityFailed,
 }
 
 impl fmt::Display for CubismError {
@@ -599,6 +662,7 @@ impl fmt::Display for CubismError {
                     "timeline incomplete: submitted {submitted}, completed {completed}"
                 )
             }
+            Self::VisibilityFailed => write!(f, "shared-memory visibility operation failed"),
         }
     }
 }
@@ -611,6 +675,43 @@ mod tests {
 
     use super::*;
     use std::alloc::{Layout, alloc_zeroed, dealloc};
+    use std::sync::Mutex;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum CacheOp {
+        Data(SharedByteRange),
+        Publish(SharedByteRange),
+        Invalidate(SharedByteRange),
+    }
+
+    struct RecordedVisibility(Mutex<std::vec::Vec<CacheOp>>);
+
+    impl RecordedVisibility {
+        fn new() -> Self {
+            Self(Mutex::new(std::vec::Vec::new()))
+        }
+
+        fn operations(&self) -> std::vec::Vec<CacheOp> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    impl VisibilityOps for RecordedVisibility {
+        fn cpu_make_gpu_visible(&self, range: SharedByteRange) -> Result<()> {
+            self.0.lock().unwrap().push(CacheOp::Data(range));
+            Ok(())
+        }
+
+        fn cpu_publish_slot(&self, range: SharedByteRange) -> Result<()> {
+            self.0.lock().unwrap().push(CacheOp::Publish(range));
+            Ok(())
+        }
+
+        fn gpu_make_cpu_visible(&self, range: SharedByteRange) -> Result<()> {
+            self.0.lock().unwrap().push(CacheOp::Invalidate(range));
+            Ok(())
+        }
+    }
 
     struct Region {
         ptr: *mut u8,
@@ -640,7 +741,7 @@ mod tests {
 
         let memory = Region::new(BYTES);
         let ring = unsafe {
-            ExecRing::from_raw_parts(memory.ptr, BYTES, 0x1_0000_0000, COUNT, STRIDE).unwrap()
+            ExecRing::from_raw_parts(memory.ptr, BYTES, SharedResourceId(7), COUNT, STRIDE).unwrap()
         };
         unsafe { ring.initialize_fresh() };
 
@@ -653,6 +754,14 @@ mod tests {
         let published = cpu.publish(5, 42, &visibility).unwrap();
 
         assert_eq!(published.payload(), b"hello");
+        assert_eq!(
+            published.payload_range(),
+            SharedByteRange {
+                resource: SharedResourceId(7),
+                offset: 64,
+                byte_length: 5,
+            }
+        );
         assert_eq!(published.resource_revision(), 42);
 
         published.mark_in_flight(100).unwrap();
@@ -662,5 +771,35 @@ mod tests {
         );
         assert!(ring.retire(index, generation, 99, &visibility).is_err());
         ring.retire(index, generation, 100, &visibility).unwrap();
+    }
+
+    #[test]
+    fn noncoherent_visibility_orders_data_then_control_then_retire_invalidate() {
+        const STRIDE: usize = 256;
+        let memory = Region::new(STRIDE);
+        let ring = unsafe {
+            ExecRing::from_raw_parts(memory.ptr, STRIDE, SharedResourceId(11), 1, STRIDE).unwrap()
+        };
+        unsafe { ring.initialize_fresh() };
+        let visibility = RecordedVisibility::new();
+        let mut cpu = ring.try_acquire().unwrap();
+        cpu.payload_mut()[..3].copy_from_slice(b"cmd");
+        let published = cpu.publish(3, 1, &visibility).unwrap();
+        published.mark_in_flight(1).unwrap();
+        ring.retire(0, 0, 1, &visibility).unwrap();
+
+        let range = |offset, byte_length| SharedByteRange {
+            resource: SharedResourceId(11),
+            offset,
+            byte_length,
+        };
+        assert_eq!(
+            visibility.operations(),
+            std::vec![
+                CacheOp::Data(range(0, 67)),
+                CacheOp::Publish(range(0, 64)),
+                CacheOp::Invalidate(range(64, 3)),
+            ]
+        );
     }
 }
