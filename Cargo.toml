@@ -15,12 +15,19 @@ required-features = ["host"]
 # Host ingestion is deliberately opt-in at the package boundary.  Bare-metal
 # consumers get only `core`, with no parser, filesystem, or database backend.
 default = ["host"]
-host = ["dep:base64", "dep:gltf", "dep:log_os_core", "dep:redb", "dep:serde", "dep:serde_json"]
+host = ["dep:base64", "dep:gltf", "dep:log_os_core", "dep:redb", "dep:serde", "dep:serde_json", "dep:v"]
 
 [dependencies]
 base64 = { version = "0.22", optional = true }
 gltf = { version = "1.4.1", optional = true }
 log_os_core = { package = "log-os", path = "../TRUEOS-Blueprints/crates/log-os", default-features = false, optional = true }
-redb = { version = "4.2.0", features = ["experimental-api-5"], optional = true }
+redb = { version = "4.2.0", default-features = false, features = ["experimental-api-5"], optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
+v = { package = "v", path = "../TRUEOS/crates/trueos-v", optional = true }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
