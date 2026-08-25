@@ -4,11 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [lib]
-path = "lib.rs"
+path = "src/lib.rs"
 
 [[bin]]
 name = "trueos-picasso"
-path = "main.rs"
+path = "src/main.rs"
 required-features = ["host"]
 
 [features]

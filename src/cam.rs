@@ -3,9 +3,10 @@
 //! Input backends keep ownership of key and pointer events. Feed their current
 //! WASD state to [`FlyCam::step`] and pointer deltas to [`FlyCam::look`].
 //!
-//! Blueprint applications can use [`FlyCam::step_blueprint`] when the camera
-//! is driven by the TRUEOS VLayer HID broker. That adapter is Blueprint-feature
-//! gated; the reusable camera contract remains allocation-free.
+//! Blueprint applications can use [`FlyCam::step_ui4`] together with
+//! [`FlyCam::handle_ui4_pointer_event`]. UI4 remains the owner of physical
+//! HID, focus, selection, and pointer capture; the adapter only observes the
+//! events that the application has already chosen to drain.
 
 /// Projection data shared by authored glTF cameras and runtime cameras.
 #[cfg_attr(feature = "host", derive(serde::Deserialize, serde::Serialize))]
@@ -102,19 +103,23 @@ pub struct FlyCam {
     speed: f32,
     look_sensitivity: f32,
     #[cfg(feature = "blueprint")]
-    blueprint_debug: BlueprintDebugState,
+    ui4: Ui4FlyState,
 }
 
 #[cfg(feature = "blueprint")]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-struct BlueprintDebugState {
+struct Ui4FlyState {
     last_keys: Wasd,
-    last_keyboard: [u32; 3],
+    route: Option<Ui4RouteIdentity>,
     last_combo: u32,
-    last_mouse_count: u32,
-    no_keyboard: bool,
-    no_mouse: bool,
-    mouse_log_frames: u8,
+    pointer_log_frames: u8,
+}
+
+#[cfg(feature = "blueprint")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Ui4RouteIdentity {
+    cursor: trueos_bp::ui4_scene::CursorSource,
+    combo_id: u32,
 }
 
 impl FlyCam {
@@ -124,19 +129,16 @@ impl FlyCam {
             speed,
             look_sensitivity: 0.002,
             #[cfg(feature = "blueprint")]
-            blueprint_debug: BlueprintDebugState {
+            ui4: Ui4FlyState {
                 last_keys: Wasd {
                     w: false,
                     a: false,
                     s: false,
                     d: false,
                 },
-                last_keyboard: [0; 3],
+                route: None,
                 last_combo: 0,
-                last_mouse_count: 0,
-                no_keyboard: false,
-                no_mouse: false,
-                mouse_log_frames: 0,
+                pointer_log_frames: 0,
             },
         }
     }
@@ -181,173 +183,148 @@ impl FlyCam {
         }
     }
 
-    /// Consume the default Blueprint camera bindings from TRUEOS VLayer.
-    ///
-    /// The first routed keyboard/mouse pair is used (preferentially a pair
-    /// with the same `combo_id`). WASD uses USB HID Keyboard/Keypad usages and
-    /// the primary mouse button enables look. Mouse samples are read from the
-    /// exact endpoint advertised by VLayer, so unrelated devices do not move
-    /// this camera.
+    /// Sample WASD from UI4's focused route. This never drains frame events.
     #[cfg(feature = "blueprint")]
-    pub fn step_blueprint(&mut self, delta_seconds: f32) -> BlueprintInputFrame {
-        let keyboards = trueos_bp::hid::hid_hut_keyboards();
-        let mice = trueos_bp::hid::hid_hut_mice();
-        let keyboard = keyboards
+    pub fn step_ui4(
+        &mut self,
+        frame: &trueos_bp::ui4_scene::Frame,
+        delta_seconds: f32,
+    ) -> Result<Ui4InputFrame, trueos_bp::ui4_scene::Error> {
+        let routes = frame.input_routes()?;
+        let focused_keyboard = routes
             .iter()
-            .find(|keyboard| mice.iter().any(|mouse| mouse.combo_id == keyboard.combo_id))
-            .or_else(|| keyboards.first());
-        let keys = keyboard.map_or(Wasd::default(), |keyboard| Wasd {
-            w: hid_key_down(&keyboard.key_down_bits, HID_KEY_W),
-            a: hid_key_down(&keyboard.key_down_bits, HID_KEY_A),
-            s: hid_key_down(&keyboard.key_down_bits, HID_KEY_S),
-            d: hid_key_down(&keyboard.key_down_bits, HID_KEY_D),
+            .any(|route| route.application_focus)
+            .then(|| frame.keyboard_state())
+            .transpose()?
+            .flatten();
+        let route = focused_keyboard
+            .and_then(|keyboard| {
+                routes.iter().find(|route| {
+                    ui4_route_eligible(route) && ui4_keyboard_matches(route, keyboard)
+                })
+            })
+            .or_else(|| {
+                self.ui4.route.and_then(|id| {
+                    routes.iter().find(|route| {
+                        ui4_route_eligible(route) && Ui4RouteIdentity::from(*route) == id
+                    })
+                })
+            })
+            .or_else(|| routes.iter().find(|route| ui4_route_eligible(route)));
+        let identity = route.map(Ui4RouteIdentity::from);
+        if identity != self.ui4.route {
+            self.ui4.route = identity;
+            if let Some(route) = route {
+                self.ui4.last_combo = route.combo_id;
+                trueos_bp::logl::log(
+                    trueos_bp::logl::level::DEBUG,
+                    format_args!(
+                        "picasso flycam: UI4 route combo={} cursor={}:{}:{} focus={} selected={} virtual={} keyboard={}",
+                        route.combo_id,
+                        route.cursor.controller_id,
+                        route.cursor.slot_id,
+                        route.cursor.ep_target,
+                        route.application_focus as u8,
+                        route.selected_for_window as u8,
+                        route.vcursor as u8,
+                        route.keyboard.is_some() as u8
+                    ),
+                );
+                if let Some(keyboard) = route.keyboard {
+                    trueos_bp::logl::log(
+                        trueos_bp::logl::level::DEBUG,
+                        format_args!(
+                            "picasso flycam: UI4 keyboard={}:{}:{} combo={} virtual={}",
+                            keyboard.controller_id,
+                            keyboard.slot_id,
+                            keyboard.ep_target,
+                            keyboard.combo_id,
+                            keyboard.virtual_keyboard as u8,
+                        ),
+                    );
+                }
+            } else {
+                trueos_bp::logl::log(
+                    trueos_bp::logl::level::DEBUG,
+                    format_args!("picasso flycam: no focused UI4 input route"),
+                );
+            }
+        }
+        let keyboard = identity.and_then(|id| {
+            routes
+                .iter()
+                .find(|route| Ui4RouteIdentity::from(*route) == id)
+                .and_then(|route| route.keyboard)
         });
-
-        let keys_changed = keys != self.blueprint_debug.last_keys;
-        if keys_changed {
+        let keys = keyboard.map_or(Wasd::default(), wasd_from_keyboard);
+        let changed = keys != self.ui4.last_keys;
+        if changed {
             trueos_bp::logl::log(
                 trueos_bp::logl::level::DEBUG,
                 format_args!(
-                    "picasso flycam: WASD w={} a={} s={} d={}",
+                    "picasso flycam: UI4 WASD w={} a={} s={} d={}",
                     keys.w as u8, keys.a as u8, keys.s as u8, keys.d as u8
                 ),
             );
-            self.blueprint_debug.last_keys = keys;
+            self.ui4.last_keys = keys;
         }
         self.step(keys, delta_seconds);
-
-        let Some(keyboard) = keyboard else {
-            if !self.blueprint_debug.no_keyboard {
-                trueos_bp::logl::log(
-                    trueos_bp::logl::level::DEBUG,
-                    format_args!("picasso flycam: no HID keyboard available"),
-                );
-                self.blueprint_debug.no_keyboard = true;
-                self.blueprint_debug.no_mouse = false;
-            }
-            if keys_changed {
-                let [x, y, z] = self.camera.position;
-                let [qx, qy, qz, qw] = self.camera.rotation.0;
-                trueos_bp::logl::log(
-                    trueos_bp::logl::level::DEBUG,
-                    format_args!(
-                        "picasso flycam: camera=({:.3},{:.3},{:.3}) quat=({:.3},{:.3},{:.3},{:.3})",
-                        x, y, z, qx, qy, qz, qw
-                    ),
-                );
-            }
-            return BlueprintInputFrame {
-                keys,
-                mouse_samples: 0,
-                dropped_mouse_samples: 0,
-            };
-        };
-        self.blueprint_debug.no_keyboard = false;
-        if keys_changed {
-            let [x, y, z] = self.camera.position;
-            let [qx, qy, qz, qw] = self.camera.rotation.0;
-            trueos_bp::logl::log(
-                trueos_bp::logl::level::DEBUG,
-                format_args!(
-                    "picasso flycam: camera=({:.3},{:.3},{:.3}) quat=({:.3},{:.3},{:.3},{:.3})",
-                    x, y, z, qx, qy, qz, qw
-                ),
-            );
+        if changed {
+            self.log_ui4_pose("WASD");
         }
-
-        let keyboard_endpoint = [keyboard.controller_id, keyboard.slot_id, keyboard.ep_target];
-        let matching_mouse_count = mice
-            .iter()
-            .filter(|mouse| mouse.combo_id == keyboard.combo_id)
-            .count() as u32;
-        if self.blueprint_debug.last_combo != keyboard.combo_id
-            || self.blueprint_debug.last_keyboard != keyboard_endpoint
-            || self.blueprint_debug.last_mouse_count != matching_mouse_count
-        {
-            trueos_bp::logl::log(
-                trueos_bp::logl::level::DEBUG,
-                format_args!(
-                    "picasso flycam: input combo={} keyboard={}:{}:{} mice={}",
-                    keyboard.combo_id,
-                    keyboard.controller_id,
-                    keyboard.slot_id,
-                    keyboard.ep_target,
-                    matching_mouse_count
-                ),
-            );
-            for mouse in mice
-                .iter()
-                .filter(|mouse| mouse.combo_id == keyboard.combo_id)
-            {
-                trueos_bp::logl::log(
-                    trueos_bp::logl::level::DEBUG,
-                    format_args!(
-                        "picasso flycam: mouse endpoint={}:{}:{}",
-                        mouse.controller_id, mouse.slot_id, mouse.ep_target
-                    ),
-                );
-            }
-            self.blueprint_debug.last_combo = keyboard.combo_id;
-            self.blueprint_debug.last_keyboard = keyboard_endpoint;
-            self.blueprint_debug.last_mouse_count = matching_mouse_count;
-        }
-        if matching_mouse_count == 0 {
-            if !self.blueprint_debug.no_mouse {
-                trueos_bp::logl::log(
-                    trueos_bp::logl::level::DEBUG,
-                    format_args!(
-                        "picasso flycam: no mouse matched keyboard combo={}",
-                        keyboard.combo_id
-                    ),
-                );
-                self.blueprint_debug.no_mouse = true;
-            }
-        } else {
-            self.blueprint_debug.no_mouse = false;
-        }
-        let mut mouse_samples = 0u32;
-        let mut dropped_mouse_samples = 0u32;
-        for mouse in mice
-            .iter()
-            .filter(|mouse| mouse.combo_id == keyboard.combo_id)
-        {
-            let (samples, dropped) = trueos_bp::hid::hid_mouse_read(
-                mouse.controller_id,
-                mouse.slot_id,
-                mouse.ep_target,
-                BLUEPRINT_MOUSE_SAMPLE_CAP,
-            );
-            dropped_mouse_samples = dropped_mouse_samples.saturating_add(dropped);
-            for sample in samples {
-                mouse_samples = mouse_samples.saturating_add(1);
-                if sample.buttons & MOUSE_BUTTON_LEFT != 0 {
-                    self.look(sample.dx as f32, sample.dy as f32);
-                }
-            }
-        }
-        if mouse_samples != 0 || dropped_mouse_samples != 0 {
-            let periodic = self.blueprint_debug.mouse_log_frames == 0;
-            self.blueprint_debug.mouse_log_frames =
-                self.blueprint_debug.mouse_log_frames.wrapping_add(1) % 30;
-            if periodic || dropped_mouse_samples != 0 {
-                let [x, y, z] = self.camera.position;
-                let [qx, qy, qz, qw] = self.camera.rotation.0;
-                trueos_bp::logl::log(
-                    trueos_bp::logl::level::DEBUG,
-                    format_args!(
-                        "picasso flycam: mouse samples={} dropped={} camera=({:.3},{:.3},{:.3}) quat=({:.3},{:.3},{:.3},{:.3})",
-                        mouse_samples, dropped_mouse_samples, x, y, z, qx, qy, qz, qw
-                    ),
-                );
-            }
-        } else {
-            self.blueprint_debug.mouse_log_frames = 0;
-        }
-        BlueprintInputFrame {
+        Ok(Ui4InputFrame {
             keys,
-            mouse_samples,
-            dropped_mouse_samples,
+            route_count: routes.len() as u32,
+            focused: identity.is_some(),
+        })
+    }
+
+    /// Consume one pointer event already drained by the application. `allow_look`
+    /// retains application-owned gestures such as a resize grip.
+    #[cfg(feature = "blueprint")]
+    pub fn handle_ui4_pointer_event(
+        &mut self,
+        event: &trueos_bp::ui4_scene::PointerEvent,
+        allow_look: bool,
+    ) -> bool {
+        let identity = Ui4RouteIdentity {
+            cursor: event.source,
+            combo_id: event.combo_id,
+        };
+        let active = allow_look
+            && Some(identity) == self.ui4.route
+            && event.buttons_down & trueos_bp::ui4_scene::POINTER_BUTTON_PRIMARY != 0
+            && event.buttons_down & trueos_bp::ui4_scene::POINTER_BUTTON_SECONDARY == 0;
+        if !active {
+            return false;
         }
+        self.look(event.dx as f32, event.dy as f32);
+        let periodic = self.ui4.pointer_log_frames == 0;
+        self.ui4.pointer_log_frames = self.ui4.pointer_log_frames.wrapping_add(1) % 30;
+        if periodic {
+            trueos_bp::logl::log(
+                trueos_bp::logl::level::DEBUG,
+                format_args!(
+                    "picasso flycam: UI4 pointer combo={} dx={} dy={} virtual={} dropped=unavailable",
+                    event.combo_id, event.dx, event.dy, event.vcursor as u8,
+                ),
+            );
+            self.log_ui4_pose("pointer");
+        }
+        true
+    }
+
+    #[cfg(feature = "blueprint")]
+    fn log_ui4_pose(&self, source: &str) {
+        let [x, y, z] = self.camera.position;
+        let [qx, qy, qz, qw] = self.camera.rotation.0;
+        trueos_bp::logl::log(
+            trueos_bp::logl::level::DEBUG,
+            format_args!(
+                "picasso flycam: UI4 {} combo={} camera=({:.3},{:.3},{:.3}) quat=({:.3},{:.3},{:.3},{:.3})",
+                source, self.ui4.last_combo, x, y, z, qx, qy, qz, qw
+            ),
+        );
     }
 }
 
@@ -356,21 +333,49 @@ pub const HID_KEY_A: u8 = 0x04;
 pub const HID_KEY_D: u8 = 0x07;
 pub const HID_KEY_S: u8 = 0x16;
 pub const HID_KEY_W: u8 = 0x1a;
-pub const MOUSE_BUTTON_LEFT: u8 = 1;
 #[cfg(feature = "blueprint")]
-const BLUEPRINT_MOUSE_SAMPLE_CAP: u32 = 64;
-
-#[cfg(feature = "blueprint")]
-fn hid_key_down(bits: &[u32; 8], usage: u8) -> bool {
-    let index = usage as usize;
-    bits[index / 32] & (1u32 << (index % 32)) != 0
+impl From<&trueos_bp::ui4_scene::InputRoute> for Ui4RouteIdentity {
+    fn from(route: &trueos_bp::ui4_scene::InputRoute) -> Self {
+        Self {
+            cursor: route.cursor,
+            combo_id: route.combo_id,
+        }
+    }
 }
 
-/// Input accounting returned by [`FlyCam::step_blueprint`].
+#[cfg(feature = "blueprint")]
+fn ui4_route_eligible(route: &trueos_bp::ui4_scene::InputRoute) -> bool {
+    route.application_focus && route.selected_for_window
+}
+
+#[cfg(feature = "blueprint")]
+fn ui4_keyboard_matches(
+    route: &trueos_bp::ui4_scene::InputRoute,
+    keyboard: trueos_bp::ui4_scene::KeyboardState,
+) -> bool {
+    route.keyboard.is_some_and(|candidate| {
+        candidate.controller_id == keyboard.controller_id
+            && candidate.slot_id == keyboard.slot_id
+            && candidate.ep_target == keyboard.ep_target
+            && candidate.combo_id == keyboard.combo_id
+    })
+}
+
+#[cfg(feature = "blueprint")]
+fn wasd_from_keyboard(keyboard: trueos_bp::ui4_scene::KeyboardState) -> Wasd {
+    Wasd {
+        w: keyboard.is_down(HID_KEY_W),
+        a: keyboard.is_down(HID_KEY_A),
+        s: keyboard.is_down(HID_KEY_S),
+        d: keyboard.is_down(HID_KEY_D),
+    }
+}
+
+/// UI4-routed input accounting. UI4 exposes no pointer-drop count in this ABI.
 #[cfg(feature = "blueprint")]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct BlueprintInputFrame {
+pub struct Ui4InputFrame {
     pub keys: Wasd,
-    pub mouse_samples: u32,
-    pub dropped_mouse_samples: u32,
+    pub route_count: u32,
+    pub focused: bool,
 }

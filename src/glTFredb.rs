@@ -3,7 +3,7 @@
 //! A collection is deliberately absent here: glTF nodes describe transform
 //! hierarchy, while collections are an editor concern and must not imply parentage.
 
-#[path = "MASS.rs"]
+#[path = "nosql.rs"]
 pub mod mass;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};

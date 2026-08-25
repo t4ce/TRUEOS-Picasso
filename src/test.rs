@@ -84,15 +84,21 @@ mod cam_tests {
     fn mouse_look_uses_a_unit_quaternion() {
         let mut fly = FlyCam::new(camera(), 1.0);
         fly.look(30.0, -12.0);
-        let norm = fly.camera.rotation.0.into_iter().map(|v| v * v).sum::<f32>();
+        let norm = fly
+            .camera
+            .rotation
+            .0
+            .into_iter()
+            .map(|v| v * v)
+            .sum::<f32>();
         assert!((norm - 1.0).abs() < 1.0e-5);
         assert!(fly.camera.rotation.rotate([0.0, 0.0, -1.0])[0] > 0.0);
     }
 }
 
 mod cubism_tests {
-    use crate::cubism::*;
     use crate::SharedResourceId;
+    use crate::cubism::*;
 
     extern crate std;
 
@@ -271,7 +277,9 @@ mod gltf_tests {
         let p = std::env::temp_dir().join(format!("picasso-camera-{}", std::process::id()));
         let _ = fs::remove_file(&p);
         let store = Store::create(p.to_str().unwrap()).unwrap();
-        let revision = store.import("camera", &camera_json(), &BTreeMap::new()).unwrap();
+        let revision = store
+            .import("camera", &camera_json(), &BTreeMap::new())
+            .unwrap();
         let node = store.node(&eid(revision, "node", 0)).unwrap();
         let camera_id = node.camera.unwrap();
         assert_eq!(node.matrix[3][..3], [1.0, 2.0, 3.0]);
