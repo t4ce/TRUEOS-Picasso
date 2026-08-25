@@ -216,28 +216,3 @@ fn sync_directory(path: &Path) -> Result<()> {
     File::open(path)?.sync_all()?;
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn publishes_reopens_and_reads_ranges() {
-        let base = std::env::temp_dir().join(format!("picasso-mass-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&base);
-        fs::create_dir_all(&base).unwrap();
-        let catalog = base.join("catalog.redb");
-        let payloads = base.join("payloads");
-
-        let store = Store::open(&catalog, &payloads).unwrap();
-        let id = store.put("texture/albedo", b"0123456789").unwrap();
-        assert_eq!(store.read_range(id, 3, 4).unwrap(), b"3456");
-        assert_eq!(store.info(id).unwrap().byte_length, 10);
-        drop(store);
-
-        let reopened = Store::open(&catalog, &payloads).unwrap();
-        assert_eq!(reopened.read(id).unwrap(), b"0123456789");
-        assert!(reopened.read_range(id, 9, 2).is_err());
-        let _ = fs::remove_dir_all(base);
-    }
-}

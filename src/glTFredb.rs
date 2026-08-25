@@ -6,11 +6,10 @@
 #[path = "MASS.rs"]
 pub mod mass;
 
-use std::{collections::BTreeMap, path::Path};
-
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
+use v::collections::BTreeMap;
 
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("picasso_meta_v1");
 const RECORDS: TableDefinition<&str, &[u8]> = TableDefinition::new("picasso_records_v1");
@@ -137,8 +136,18 @@ pub struct Node {
     pub id: String,
     pub name: Option<String>,
     pub mesh: Option<String>,
+    /// Optional for compatibility with records imported before camera support.
+    #[serde(default)]
+    pub camera: Option<String>,
     pub children: Vec<String>,
     pub matrix: [[f32; 4]; 4],
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Camera {
+    pub encoding: u16,
+    pub id: String,
+    pub name: Option<String>,
+    pub projection: crate::cam::Projection,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Mesh {
@@ -188,12 +197,12 @@ pub struct Store {
 }
 
 impl Store {
-    pub fn create(path: impl AsRef<Path>) -> Result<Self> {
+    pub fn create(path: &str) -> Result<Self> {
         Ok(Self {
             db: Database::create(path)?,
         })
     }
-    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+    pub fn open(path: &str) -> Result<Self> {
         Ok(Self {
             db: Database::open(path)?,
         })
@@ -279,11 +288,39 @@ impl Store {
                     id: id.clone(),
                     name: node.name().map(str::to_owned),
                     mesh: node.mesh().map(|m| eid(revision_id, "mesh", m.index())),
+                    camera: node.camera().map(|c| eid(revision_id, "camera", c.index())),
                     children: node
                         .children()
                         .map(|n| eid(revision_id, "node", n.index()))
                         .collect(),
                     matrix: node.transform().matrix(),
+                },
+            )?;
+        }
+        for camera in parsed.doc.cameras() {
+            let id = eid(revision_id, "camera", camera.index());
+            let projection = match camera.projection() {
+                gltf::camera::Projection::Perspective(p) => crate::cam::Projection::Perspective {
+                    yfov: p.yfov(),
+                    znear: p.znear(),
+                    zfar: p.zfar(),
+                    aspect_ratio: p.aspect_ratio(),
+                },
+                gltf::camera::Projection::Orthographic(o) => crate::cam::Projection::Orthographic {
+                    xmag: o.xmag(),
+                    ymag: o.ymag(),
+                    znear: o.znear(),
+                    zfar: o.zfar(),
+                },
+            };
+            put(
+                &mut records,
+                &id,
+                &Camera {
+                    encoding: 1,
+                    id: id.clone(),
+                    name: camera.name().map(str::to_owned),
+                    projection,
                 },
             )?;
         }
@@ -444,6 +481,25 @@ impl Store {
             Err(Error::UnknownRevision(id))
         }
     }
+    /// Loads a normalized node, including its optional camera reference.
+    pub fn node(&self, record_id: &str) -> Result<Node> {
+        self.record(record_id)
+    }
+
+    /// Loads normalized glTF projection data ready for [`crate::cam::Camera`].
+    pub fn camera(&self, record_id: &str) -> Result<Camera> {
+        self.record(record_id)
+    }
+
+    fn record<T: for<'a> Deserialize<'a>>(&self, record_id: &str) -> Result<T> {
+        let read = self.db.begin_read()?;
+        let table = read.open_table(RECORDS)?;
+        let value = table
+            .get(record_id)?
+            .ok_or_else(|| Error::UnknownRecord(record_id.to_owned()))?;
+        decode(value.value())
+    }
+
     pub fn blob(&self, blob_id: &str) -> Result<Vec<u8>> {
         let read = self.db.begin_read()?;
         let t = read.open_table(BLOBS)?;
@@ -495,7 +551,7 @@ impl Prepared {
         Ok(Self { doc, buffers })
     }
 }
-fn eid(revision: u64, kind: &str, index: usize) -> String {
+pub(crate) fn eid(revision: u64, kind: &str, index: usize) -> String {
     format!("r/{revision}/{kind}/{index}")
 }
 fn encode<T: Serialize>(v: &T) -> Result<Vec<u8>> {
@@ -550,82 +606,4 @@ fn insert_missing_tracking(write: &redb::WriteTransaction, keys: Vec<String>) ->
         }
     }
     Ok(inserted)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs;
-    fn json() -> Vec<u8> {
-        br#"{"asset":{"version":"2.0"},"buffers":[{"uri":"data:application/octet-stream;base64,AAAAAAAAAAAAAAAA","byteLength":12}],"bufferViews":[{"buffer":0,"byteLength":12}],"accessors":[{"bufferView":0,"componentType":5126,"count":1,"type":"VEC3","min":[0,0,0],"max":[0,0,0]}],"meshes":[{"primitives":[{"attributes":{"POSITION":0}}]}],"nodes":[{"mesh":0},{"children":[0]}],"scenes":[{"nodes":[1]}],"scene":0}"#.to_vec()
-    }
-    #[test]
-    fn persists_graph_and_source() {
-        let p = std::env::temp_dir().join(format!("picasso-{}", std::process::id()));
-        let _ = fs::remove_file(&p);
-        let s = Store::create(&p).unwrap();
-        let r = s.import("cube", &json(), &BTreeMap::new()).unwrap();
-        assert_eq!(s.revision(r).unwrap().state, RevisionState::Complete);
-        assert_eq!(s.blob(&format!("r/{r}/blob/source")).unwrap(), json());
-        drop(s);
-        let s = Store::open(&p).unwrap();
-        assert!(s.revision(r).is_ok());
-        let _ = fs::remove_file(p);
-    }
-    #[test]
-    fn reimports_are_immutable() {
-        let p = std::env::temp_dir().join(format!("picasso-r-{}", std::process::id()));
-        let _ = fs::remove_file(&p);
-        let s = Store::create(&p).unwrap();
-        let a = s.import("a", &json(), &BTreeMap::new()).unwrap();
-        let b = s.import("a", &json(), &BTreeMap::new()).unwrap();
-        assert_ne!(a, b);
-        assert_eq!(s.revision(a).unwrap().id, a);
-        let _ = fs::remove_file(p);
-    }
-    #[test]
-    fn failed_import_is_invisible() {
-        let p = std::env::temp_dir().join(format!("picasso-f-{}", std::process::id()));
-        let _ = fs::remove_file(&p);
-        let s = Store::create(&p).unwrap();
-        assert!(
-            s.import(
-                "bad",
-                br#"{"asset":{"version":"2.0"},"buffers":[{"uri":"x.bin","byteLength":4}]}"#,
-                &BTreeMap::new()
-            )
-            .is_err()
-        );
-        assert!(s.revision(1).is_err());
-        let _ = fs::remove_file(p);
-    }
-
-    #[test]
-    fn tracking_starts_false_and_respects_progression() {
-        let p = std::env::temp_dir().join(format!("picasso-t-{}", std::process::id()));
-        let _ = fs::remove_file(&p);
-        let s = Store::create(&p).unwrap();
-        let revision = s.import("tracked", &json(), &BTreeMap::new()).unwrap();
-        let node = eid(revision, "node", 0);
-        assert_eq!(s.tracking(&node).unwrap(), Some(Tracking::default()));
-        assert!(
-            s.set_tracking(
-                &node,
-                Tracking {
-                    included: false,
-                    fully_respected: true,
-                    tested: false,
-                }
-            )
-            .is_err()
-        );
-        let progressed = Tracking {
-            included: true,
-            fully_respected: false,
-            tested: true,
-        };
-        s.set_tracking(&node, progressed).unwrap();
-        assert_eq!(s.tracking(&node).unwrap(), Some(progressed));
-        let _ = fs::remove_file(p);
-    }
 }

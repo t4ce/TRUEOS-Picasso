@@ -8,6 +8,9 @@
 pub mod core;
 pub use core::*;
 
+/// Renderer- and input-backend-neutral camera data and fly-camera controls.
+pub mod cam;
+
 /// Reusable neutral reference-grid geometry for line-list capable backends.
 pub mod grid;
 pub use grid::{GRID_INDICES, GRID_VERTICES};
@@ -36,9 +39,8 @@ pub use host::*;
 /// `Store` preserves the parsed glTF graph, while this module provides direct
 /// access to the original GLB, JSON chunk, and BIN chunk.
 #[cfg(feature = "host")]
-#[path = "library.rs"]
-mod glb_library {
-+    //! Minimal GLB -> redb dump library.
+pub(crate) mod glb_library {
+    //! Minimal GLB -> redb dump library.
     //!
     //! Cargo.toml:
     //! [dependencies]
@@ -56,7 +58,6 @@ mod glb_library {
     
     use std::error::Error;
     use std::fmt;
-    use std::path::Path;
     
     use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
     
@@ -91,7 +92,7 @@ mod glb_library {
     ///
     /// `Database::create` is intentionally used here because redb opens an
     /// existing valid database without truncating it.
-    pub fn open_database(path: impl AsRef<Path>) -> Result<Database> {
+    pub fn open_database(path: &str) -> Result<Database> {
         Ok(Database::create(path)?)
     }
     
@@ -103,7 +104,7 @@ mod glb_library {
     ///
     /// This preserves all existing unrelated tables in `assets.redb`.
     pub async fn dump_glb_file(
-        db_path: impl AsRef<Path>,
+        db_path: &str,
         asset_id: &str,
         glb_path: &str,
     ) -> Result<ImportStats> {
@@ -207,7 +208,7 @@ mod glb_library {
             .map(|value| value.value().to_vec()))
     }
     
-    fn normalize_asset_id(asset_id: &str) -> Result<String> {
+    pub(crate) fn normalize_asset_id(asset_id: &str) -> Result<String> {
         let id = asset_id.trim().trim_matches('/');
     
         if id.is_empty() {
@@ -225,18 +226,6 @@ mod glb_library {
         format!("{asset_id}/{part}")
     }
     
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-    
-        #[test]
-        fn asset_id_normalization() {
-            assert_eq!(normalize_asset_id("/models/robot/").unwrap(), "models/robot");
-            assert!(normalize_asset_id("").is_err());
-            assert!(normalize_asset_id("///").is_err());
-        }
-    }
-    
 }
 
 #[cfg(feature = "host")]
@@ -244,3 +233,6 @@ pub use glb_library::{
     dump_glb_bytes, dump_glb_file, load_bin_chunk, load_glb, load_json_chunk, open_database,
     ImportStats, GLB_DUMP,
 };
+
+#[cfg(test)]
+mod test;
