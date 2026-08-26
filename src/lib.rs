@@ -1,7 +1,7 @@
 //! TRUEOS Picasso.
 //!
 //! `core` is the bare-metal, `no_std` contract.  The host importer, glTF
-//! parser, redb Dealer backend, CLI, and filesystem MASS adapter are enabled
+//! parser, redb Dealer backend, and filesystem MASS adapter are enabled
 //! only by the `host` feature.
 #![cfg_attr(not(feature = "host"), no_std)]
 
@@ -22,7 +22,7 @@ pub mod cubism;
 
 pub use cubism::{
     CoherentVisibility, CpuSlot, CubismError, DealerRingRecord, ExecRing, ExecSlotHeader,
-    PublishedSlot, SharedByteRange, VisibilityOps,
+    PublishedSlot, SharedByteRange, VVideoRingError, VisibilityOps,
 };
 
 #[cfg(feature = "host")]
@@ -55,10 +55,8 @@ pub(crate) mod glb_library {
     //! Importing the same asset_id again is idempotent: the keys are overwritten.
     //! Existing unrelated redb tables are untouched.
 
-    use std::error::Error;
-    use std::fmt;
-
     use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+    use std::error::Error;
 
     /// One table acts as the "collection" for imported GLB assets.
     ///
@@ -67,17 +65,6 @@ pub(crate) mod glb_library {
     pub const GLB_DUMP: TableDefinition<&str, &[u8]> = TableDefinition::new("glb_dump_v1");
 
     pub type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync + 'static>>;
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    struct TrueosFsError(i32);
-
-    impl fmt::Display for TrueosFsError {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write!(f, "TRUEOSFS operation failed with error code {}", self.0)
-        }
-    }
-
-    impl Error for TrueosFsError {}
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct ImportStats {
@@ -93,25 +80,6 @@ pub(crate) mod glb_library {
     /// existing valid database without truncating it.
     pub fn open_database(path: &str) -> Result<Database> {
         Ok(Database::create(path)?)
-    }
-
-    /// Convenience entry point:
-    ///
-    ///     v::vfs_async::block_on(
-    ///         dump_glb_file("assets.redb", "models/robot", "trueosfs:disc3/robot.glb")
-    ///     )?;
-    ///
-    /// This preserves all existing unrelated tables in `assets.redb`.
-    pub async fn dump_glb_file(
-        db_path: &str,
-        asset_id: &str,
-        glb_path: &str,
-    ) -> Result<ImportStats> {
-        let bytes = v::vfs_async::read_file(glb_path.as_bytes())
-            .await
-            .map_err(TrueosFsError)?;
-        let db = open_database(db_path)?;
-        dump_glb_bytes(&db, asset_id, &bytes)
     }
 
     /// Dump an in-memory GLB into redb.
@@ -224,8 +192,7 @@ pub(crate) mod glb_library {
 
 #[cfg(feature = "host")]
 pub use glb_library::{
-    GLB_DUMP, ImportStats, dump_glb_bytes, dump_glb_file, load_bin_chunk, load_glb,
-    load_json_chunk, open_database,
+    GLB_DUMP, ImportStats, dump_glb_bytes, load_bin_chunk, load_glb, load_json_chunk, open_database,
 };
 
 #[cfg(test)]

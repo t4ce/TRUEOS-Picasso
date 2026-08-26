@@ -9,7 +9,7 @@ pub mod mass;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
-use v::collections::BTreeMap;
+use std::{collections::BTreeMap, fs, path::Path};
 
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("picasso_meta_v1");
 const RECORDS: TableDefinition<&str, &[u8]> = TableDefinition::new("picasso_records_v1");
@@ -206,6 +206,26 @@ impl Store {
         Ok(Self {
             db: Database::open(path)?,
         })
+    }
+
+    /// Import a glTF/GLB file and resolve any adjacent external buffer URIs.
+    ///
+    /// The caller owns catalog policy (`asset_id` and which paths to import);
+    /// Picasso owns parsing and durable database representation.
+    pub fn import_file(&self, asset_id: &str, path: impl AsRef<Path>) -> Result<u64> {
+        let path = path.as_ref();
+        let source = fs::read(path)?;
+        let parsed = gltf::Gltf::from_slice(&source)?;
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let mut external = BTreeMap::new();
+        for buffer in parsed.document.buffers() {
+            if let gltf::buffer::Source::Uri(uri) = buffer.source()
+                && !uri.starts_with("data:")
+            {
+                external.insert(uri.to_owned(), fs::read(parent.join(uri))?);
+            }
+        }
+        self.import(asset_id, &source, &external)
     }
 
     /// Imports `.gltf` JSON or `.glb`. `external` maps URI strings to their exact bytes.

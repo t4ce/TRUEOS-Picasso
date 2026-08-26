@@ -615,6 +615,14 @@ pub enum CubismError {
     VisibilityFailed,
 }
 
+/// Error returned while materializing a Cubism execution ring in TRUEOS
+/// vVideo memory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VVideoRingError {
+    Vgpu(i32),
+    Cubism(CubismError),
+}
+
 impl fmt::Display for CubismError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
