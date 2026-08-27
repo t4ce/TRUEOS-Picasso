@@ -1,9 +1,12 @@
 //! TRUEOS Picasso.
 //!
-//! `core` is the bare-metal, `no_std` contract.  The host importer, glTF
-//! parser, redb Dealer backend, and filesystem MASS adapter are enabled
-//! only by the `host` feature.
+//! `core` is the bare-metal, `no_std` contract. The `blueprint` feature adds
+//! Picasso's runtime embedded-asset intake. Host parsing and filesystem
+//! adapters remain behind the `host` feature.
 #![cfg_attr(not(feature = "host"), no_std)]
+
+#[cfg(feature = "runtime-assets")]
+extern crate alloc;
 
 pub mod core;
 pub use core::*;
@@ -24,6 +27,13 @@ pub use cubism::{
     CoherentVisibility, CpuSlot, CubismError, DealerRingRecord, ExecRing, ExecSlotHeader,
     PublishedSlot, SharedByteRange, VVideoRingError, VisibilityOps,
 };
+
+/// Ephemeral exact-byte asset storage owned by a running Blueprint.
+#[cfg(feature = "runtime-assets")]
+mod runtime_assets;
+
+#[cfg(feature = "runtime-assets")]
+pub use runtime_assets::{Picasso, PicassoError};
 
 #[cfg(feature = "host")]
 #[path = "glTFredb.rs"]

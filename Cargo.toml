@@ -10,8 +10,9 @@ path = "src/lib.rs"
 # Host ingestion is deliberately opt-in at the package boundary.  Bare-metal
 # consumers get only `core`, with no parser, filesystem, or database backend.
 default = ["host"]
-blueprint = ["dep:trueos_bp"]
-host = ["dep:base64", "dep:gltf", "dep:log_os_core", "dep:redb", "dep:serde", "dep:serde_json", "redb/std"]
+blueprint = ["dep:trueos_bp", "runtime-assets"]
+host = ["dep:base64", "dep:gltf", "dep:log_os_core", "dep:serde", "dep:serde_json", "redb/std", "runtime-assets"]
+runtime-assets = ["dep:redb"]
 test-std = ["redb/std"]
 
 [dependencies]
