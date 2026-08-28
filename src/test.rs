@@ -82,6 +82,30 @@ mod cam_tests {
             0.5,
         );
         assert_eq!(fly.camera.position, [0.0, 0.0, -2.0]);
+        fly.step(
+            Wasd {
+                s: true,
+                ..Wasd::default()
+            },
+            0.5,
+        );
+        assert_eq!(fly.camera.position, [0.0, 0.0, 0.0]);
+        fly.step(
+            Wasd {
+                d: true,
+                ..Wasd::default()
+            },
+            0.25,
+        );
+        assert_eq!(fly.camera.position, [1.0, 0.0, 0.0]);
+        fly.step(
+            Wasd {
+                a: true,
+                ..Wasd::default()
+            },
+            0.25,
+        );
+        assert_eq!(fly.camera.position, [0.0, 0.0, 0.0]);
         fly.set_speed(8.0);
         assert_eq!(fly.speed(), 8.0);
     }
@@ -99,6 +123,21 @@ mod cam_tests {
             .sum::<f32>();
         assert!((norm - 1.0).abs() < 1.0e-5);
         assert!(fly.camera.rotation.rotate([0.0, 0.0, -1.0])[0] > 0.0);
+    }
+
+    #[test]
+    fn mouse_yaw_uses_camera_up_when_the_camera_is_rolled() {
+        let mut rolled = camera();
+        rolled.rotation = Quaternion::from_axis_angle([1.0, 0.0, 0.0], core::f32::consts::PI);
+        let mut fly = FlyCam::new(rolled, 1.0);
+
+        fly.look(30.0, 0.0);
+
+        let forward = fly.camera.rotation.rotate([0.0, 0.0, -1.0]);
+        assert!(
+            forward[0] > 0.0,
+            "cursor-right must remain visual-right after camera roll"
+        );
     }
 }
 

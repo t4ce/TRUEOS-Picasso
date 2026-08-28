@@ -159,12 +159,12 @@ impl FlyCam {
         self.look_sensitivity = radians_per_pixel.max(0.0);
     }
 
-    /// Applies a pointer delta. Positive x turns right; positive y turns down,
-    /// matching the usual window-coordinate convention.
+    /// Applies camera-local quaternion yaw and pitch. Positive x turns toward
+    /// the camera's visual right and positive y turns down at any camera roll.
     pub fn look(&mut self, delta_x: f32, delta_y: f32) {
         let yaw = Quaternion::from_axis_angle([0.0, 1.0, 0.0], -delta_x * self.look_sensitivity);
         let pitch = Quaternion::from_axis_angle([1.0, 0.0, 0.0], -delta_y * self.look_sensitivity);
-        self.camera.rotation = (yaw * self.camera.rotation * pitch).normalized();
+        self.camera.rotation = (self.camera.rotation * yaw * pitch).normalized();
     }
 
     /// Moves in camera-local X/Z. Opposing keys cancel and diagonals are
@@ -279,8 +279,9 @@ impl FlyCam {
         })
     }
 
-    /// Consume one pointer event already drained by the application. `allow_look`
-    /// retains application-owned gestures such as a resize grip.
+    /// Consume one pointer event already drained by the application. Camera
+    /// look is active only while the middle mouse button is held. `allow_look`
+    /// preserves application-owned hit regions such as a resize grip.
     #[cfg(feature = "blueprint")]
     pub fn handle_ui4_pointer_event(
         &mut self,
@@ -291,10 +292,11 @@ impl FlyCam {
             cursor: event.source,
             combo_id: event.combo_id,
         };
+        let look_gesture = event.buttons_down & trueos_bp::ui4_scene::POINTER_BUTTON_MIDDLE != 0;
         let active = allow_look
             && Some(identity) == self.ui4.route
-            && event.buttons_down & trueos_bp::ui4_scene::POINTER_BUTTON_PRIMARY != 0
-            && event.buttons_down & trueos_bp::ui4_scene::POINTER_BUTTON_SECONDARY == 0;
+            && look_gesture
+            && (event.dx != 0 || event.dy != 0);
         if !active {
             return false;
         }
