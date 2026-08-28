@@ -43,9 +43,15 @@ mod grid_tests {
     use crate::grid::*;
 
     #[test]
-    fn grid_is_three_independent_line_segments() {
+    fn grid_is_three_directed_unit_basis_axes_from_the_origin() {
         assert_eq!(GRID_VERTICES.len(), 6);
         assert_eq!(GRID_INDICES, [0, 1, 0, 1, 0, 1]);
+        assert_eq!(GRID_VERTICES[0], [0.0, 0.0, 0.0]);
+        assert_eq!(GRID_VERTICES[1], [1.0, 0.0, 0.0]);
+        assert_eq!(GRID_VERTICES[2], [0.0, 0.0, 0.0]);
+        assert_eq!(GRID_VERTICES[3], [0.0, 1.0, 0.0]);
+        assert_eq!(GRID_VERTICES[4], [0.0, 0.0, 0.0]);
+        assert_eq!(GRID_VERTICES[5], [0.0, 0.0, 1.0]);
     }
 }
 
