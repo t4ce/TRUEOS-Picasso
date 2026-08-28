@@ -4,9 +4,8 @@
 //! creates one [`Picasso`], inserts its embedded assets, and keeps that owner
 //! alive for as long as those assets are needed.
 
-use redb::{Database, TableDefinition};
-#[cfg(test)]
-use redb::{ReadableDatabase, ReadableTable};
+use alloc::vec::Vec;
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 
 const ASSETS: TableDefinition<&str, &[u8]> = TableDefinition::new("picasso_runtime_assets_v1");
 
@@ -47,6 +46,15 @@ impl Picasso {
     pub fn put_embedded_asset(&self, name: &str, bytes: &[u8]) -> Result<(), PicassoError> {
         self.assets.insert(name, bytes)
     }
+
+    /// Returns an owned copy of the exact bytes stored under `name`.
+    ///
+    /// The copy is deliberate: no redb transaction or storage guard crosses
+    /// Picasso's public boundary, so callers can safely retain the bytes while
+    /// Picasso continues serving the rest of the runtime asset catalog.
+    pub fn embedded_asset(&self, name: &str) -> Result<Option<Vec<u8>>, PicassoError> {
+        self.assets.get(name)
+    }
 }
 
 struct RuntimeAssetDatabase {
@@ -78,8 +86,7 @@ impl RuntimeAssetDatabase {
         write.commit().map_err(|_| PicassoError::Storage)
     }
 
-    #[cfg(test)]
-    fn contains_exact(&self, name: &str, expected: &[u8]) -> Result<bool, PicassoError> {
+    fn get(&self, name: &str) -> Result<Option<Vec<u8>>, PicassoError> {
         validate_name(name)?;
         let read = self
             .database
@@ -87,12 +94,12 @@ impl RuntimeAssetDatabase {
             .map_err(|_| PicassoError::Storage)?;
         let assets = match read.open_table(ASSETS) {
             Ok(assets) => assets,
-            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
             Err(_) => return Err(PicassoError::Storage),
         };
         assets
             .get(name)
-            .map(|stored| stored.is_some_and(|value| value.value() == expected))
+            .map(|stored| stored.map(|value| value.value().to_vec()))
             .map_err(|_| PicassoError::Storage)
     }
 }
@@ -116,8 +123,14 @@ mod tests {
 
         picasso.put_embedded_asset("mesh", &bytes).unwrap();
 
-        assert!(picasso.assets.contains_exact("mesh", &bytes).unwrap());
-        assert!(!picasso.assets.contains_exact("mesh", b"different").unwrap());
+        assert_eq!(
+            picasso.embedded_asset("mesh").unwrap(),
+            Some(bytes.to_vec())
+        );
+        assert_ne!(
+            picasso.embedded_asset("mesh").unwrap(),
+            Some(b"different".to_vec())
+        );
     }
 
     #[test]
@@ -127,9 +140,15 @@ mod tests {
         picasso.put_embedded_asset("b", b"second").unwrap();
         picasso.put_embedded_asset("a", b"replacement").unwrap();
 
-        assert!(picasso.assets.contains_exact("a", b"replacement").unwrap());
-        assert!(picasso.assets.contains_exact("b", b"second").unwrap());
-        assert!(!picasso.assets.contains_exact("missing", b"").unwrap());
+        assert_eq!(
+            picasso.embedded_asset("a").unwrap(),
+            Some(b"replacement".to_vec())
+        );
+        assert_eq!(
+            picasso.embedded_asset("b").unwrap(),
+            Some(b"second".to_vec())
+        );
+        assert_eq!(picasso.embedded_asset("missing").unwrap(), None);
     }
 
     #[test]
@@ -140,7 +159,7 @@ mod tests {
             Err(PicassoError::EmptyAssetName)
         );
         assert_eq!(
-            picasso.assets.contains_exact("", b""),
+            picasso.embedded_asset(""),
             Err(PicassoError::EmptyAssetName)
         );
     }
