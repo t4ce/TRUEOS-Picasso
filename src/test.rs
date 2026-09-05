@@ -403,6 +403,122 @@ mod gltf_tests {
         assert_eq!(s.tracking(&node).unwrap(), Some(progressed));
         let _ = fs::remove_file(p);
     }
+
+    #[test]
+    fn derived_artifacts_reopen_with_provenance_without_changing_sources() {
+        let p = std::env::temp_dir().join(format!("picasso-derived-{}", std::process::id()));
+        let _ = fs::remove_file(&p);
+        let source = json();
+        let bytes: Vec<u8> = (0..(2 * 64 * 1024 + 19)).map(|n| (n % 251) as u8).collect();
+        let s = Store::create(p.to_str().unwrap()).unwrap();
+        let revision = s.import("scene", &source, &BTreeMap::new()).unwrap();
+        let node_id = eid(revision, "node", 0);
+        let node_before = serde_json::to_vec(&s.node(&node_id).unwrap()).unwrap();
+        assert_eq!(s.derived(revision, "scene/vertices").unwrap(), None);
+        s.put_derived(
+            revision,
+            "scene/vertices",
+            "triangles-v1; source=scene",
+            &bytes,
+        )
+        .unwrap();
+        s.put_derived(
+            revision,
+            "scene/vertices/00000000",
+            "independent-name",
+            b"other",
+        )
+        .unwrap();
+        s.put_derived(revision, "empty", "empty-v1", b"").unwrap();
+        drop(s);
+
+        let reopened = Store::open(p.to_str().unwrap()).unwrap();
+        let derived = reopened
+            .derived(revision, "scene/vertices")
+            .unwrap()
+            .unwrap();
+        assert_eq!(derived.source_revision, revision);
+        assert_eq!(derived.name, "scene/vertices");
+        assert_eq!(derived.provenance, "triangles-v1; source=scene");
+        assert_eq!(derived.bytes, bytes);
+        assert_eq!(
+            reopened
+                .derived(revision, "scene/vertices/00000000")
+                .unwrap()
+                .unwrap()
+                .bytes,
+            b"other"
+        );
+        assert!(
+            reopened
+                .derived(revision, "empty")
+                .unwrap()
+                .unwrap()
+                .bytes
+                .is_empty()
+        );
+        assert_eq!(
+            reopened
+                .blob(&reopened.revision(revision).unwrap().source_blob)
+                .unwrap(),
+            source
+        );
+        assert_eq!(
+            serde_json::to_vec(&reopened.node(&node_id).unwrap()).unwrap(),
+            node_before
+        );
+        assert_eq!(
+            reopened.tracking(&node_id).unwrap(),
+            Some(Tracking::default())
+        );
+        drop(reopened);
+        let _ = fs::remove_file(p);
+    }
+
+    #[test]
+    fn derived_publication_is_immutable_and_revision_scoped() {
+        let p = std::env::temp_dir().join(format!("picasso-derived-scope-{}", std::process::id()));
+        let _ = fs::remove_file(&p);
+        let s = Store::create(p.to_str().unwrap()).unwrap();
+        let first = s.import("a", &json(), &BTreeMap::new()).unwrap();
+        let second = s.import("a", &json(), &BTreeMap::new()).unwrap();
+        s.put_derived(first, "indices", "triangles-v1", b"first")
+            .unwrap();
+        s.put_derived(first, "indices", "triangles-v1", b"first")
+            .unwrap();
+        for (provenance, bytes) in [
+            ("triangles-v2", b"first".as_slice()),
+            ("triangles-v1", b"other"),
+        ] {
+            assert!(matches!(
+                s.put_derived(first, "indices", provenance, bytes),
+                Err(Error::DerivedConflict(_))
+            ));
+        }
+        s.put_derived(second, "indices", "triangles-v2", b"second")
+            .unwrap();
+        assert_eq!(
+            s.derived(first, "indices").unwrap().unwrap().bytes,
+            b"first"
+        );
+        assert_eq!(
+            s.derived(second, "indices").unwrap().unwrap().bytes,
+            b"second"
+        );
+        assert!(
+            s.put_derived(second + 1, "indices", "triangles-v1", b"bad")
+                .is_err()
+        );
+        assert!(s.put_derived(first, "", "triangles-v1", b"bad").is_err());
+        assert!(
+            s.put_derived(first, "bad\0name", "triangles-v1", b"bad")
+                .is_err()
+        );
+        assert!(s.put_derived(first, "unpublished", " ", b"bad").is_err());
+        assert_eq!(s.derived(first, "unpublished").unwrap(), None);
+        drop(s);
+        let _ = fs::remove_file(p);
+    }
 }
 
 mod glb_library_tests {

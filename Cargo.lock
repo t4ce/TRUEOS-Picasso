@@ -106,6 +106,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "infer"
+version = "0.22.0-trueos.1"
+
+[[package]]
 name = "inflections"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -332,6 +336,7 @@ name = "v"
 version = "0.1.0"
 dependencies = [
  "hashbrown",
+ "infer",
  "serde",
  "serde_json",
  "skrifa",

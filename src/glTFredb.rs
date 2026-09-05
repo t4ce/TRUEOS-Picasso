@@ -6,6 +6,10 @@
 #[path = "nosql.rs"]
 pub mod mass;
 
+#[path = "glb_metadata.rs"]
+mod metadata;
+pub use metadata::{GlbMetadata, inspect_glb_file};
+
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
@@ -15,6 +19,9 @@ const META: TableDefinition<&str, &[u8]> = TableDefinition::new("picasso_meta_v1
 const RECORDS: TableDefinition<&str, &[u8]> = TableDefinition::new("picasso_records_v1");
 const BLOBS: TableDefinition<&str, &[u8]> = TableDefinition::new("picasso_blob_chunks_v1");
 const TRACKING: TableDefinition<&str, &[u8]> = TableDefinition::new("picasso_tracking_v1");
+const DERIVED: TableDefinition<&str, &[u8]> = TableDefinition::new("picasso_derived_v1");
+const DERIVED_BLOBS: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("picasso_derived_blob_chunks_v1");
 const CHUNK: usize = 64 * 1024;
 
 #[derive(Debug)]
@@ -38,6 +45,9 @@ pub enum Error {
     UnknownRevision(u64),
     UnknownRecord(String),
     InvalidTrackingState,
+    InvalidGlb(&'static str),
+    InvalidDerived(&'static str),
+    DerivedConflict(String),
 }
 
 impl std::fmt::Display for Error {
@@ -67,6 +77,9 @@ impl std::fmt::Display for Error {
             Self::InvalidTrackingState => {
                 f.write_str("a record must be included before it can be respected or tested")
             }
+            Self::InvalidGlb(reason) => write!(f, "invalid GLB descriptor: {reason}"),
+            Self::InvalidDerived(reason) => write!(f, "invalid derived artifact: {reason}"),
+            Self::DerivedConflict(name) => write!(f, "derived artifact already exists: {name}"),
         }
     }
 }
@@ -189,6 +202,24 @@ pub struct Buffer {
     pub id: String,
     pub byte_length: usize,
     pub blob: String,
+}
+
+/// A derived representation with explicit provenance, separate from imported glTF records.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DerivedArtifact {
+    pub source_revision: u64,
+    pub name: String,
+    pub provenance: String,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
+struct DerivedRecord {
+    encoding: u16,
+    source_revision: u64,
+    name: String,
+    provenance: String,
+    byte_length: usize,
 }
 
 /// An append-only redb store. Re-importing an asset always creates a new revision.
@@ -533,6 +564,108 @@ impl Store {
         }
         Ok(out)
     }
+
+    /// Durably publishes an immutable derived payload beside its source revision.
+    ///
+    /// `provenance` describes the preparation policy and any additional source
+    /// revisions. Exact repeated publication is idempotent; changed bytes or
+    /// provenance require a new name. Imported records and tracking are untouched.
+    pub fn put_derived(
+        &self,
+        revision: u64,
+        name: &str,
+        provenance: &str,
+        bytes: &[u8],
+    ) -> Result<()> {
+        let key = derived_key(revision, name)?;
+        if provenance.trim().is_empty() {
+            return Err(Error::InvalidDerived("provenance must not be empty"));
+        }
+        self.revision(revision)?;
+        let record = DerivedRecord {
+            encoding: 1,
+            source_revision: revision,
+            name: name.into(),
+            provenance: provenance.into(),
+            byte_length: bytes.len(),
+        };
+        let write = self.db.begin_write()?;
+        {
+            let mut records = write.open_table(DERIVED)?;
+            let mut blobs = write.open_table(DERIVED_BLOBS)?;
+            let existing = records
+                .get(key.as_str())?
+                .map(|entry| decode::<DerivedRecord>(entry.value()))
+                .transpose()?;
+            if let Some(existing) = existing {
+                if existing != record {
+                    return Err(Error::DerivedConflict(name.into()));
+                }
+                for (index, chunk) in bytes.chunks(CHUNK).enumerate() {
+                    let chunk_key = format!("{key}/{index:08}");
+                    if blobs.get(chunk_key.as_str())?.as_ref().map(|v| v.value()) != Some(chunk) {
+                        return Err(Error::DerivedConflict(name.into()));
+                    }
+                }
+                return Ok(());
+            }
+            for (index, chunk) in bytes.chunks(CHUNK).enumerate() {
+                let chunk_key = format!("{key}/{index:08}");
+                blobs.insert(chunk_key.as_str(), chunk)?;
+            }
+            put(&mut records, &key, &record)?;
+        }
+        write.commit()?;
+        Ok(())
+    }
+
+    /// Reloads a complete derived payload after database reopening.
+    pub fn derived(&self, revision: u64, name: &str) -> Result<Option<DerivedArtifact>> {
+        let key = derived_key(revision, name)?;
+        self.revision(revision)?;
+        let read = self.db.begin_read()?;
+        let records = match read.open_table(DERIVED) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let Some(entry) = records.get(key.as_str())? else {
+            return Ok(None);
+        };
+        let record: DerivedRecord = decode(entry.value())?;
+        if record.encoding != 1 || record.source_revision != revision || record.name != name {
+            return Err(Error::InvalidDerived("record identity mismatch"));
+        }
+        let blobs = read.open_table(DERIVED_BLOBS)?;
+        let mut bytes = Vec::with_capacity(record.byte_length);
+        for index in 0..record.byte_length.div_ceil(CHUNK) {
+            let chunk_key = format!("{key}/{index:08}");
+            let chunk = blobs
+                .get(chunk_key.as_str())?
+                .ok_or(Error::InvalidDerived("missing payload chunk"))?;
+            let expected = (record.byte_length - bytes.len()).min(CHUNK);
+            if chunk.value().len() != expected {
+                return Err(Error::InvalidDerived("payload chunk length mismatch"));
+            }
+            bytes.extend_from_slice(chunk.value());
+        }
+        Ok(Some(DerivedArtifact {
+            source_revision: record.source_revision,
+            name: record.name,
+            provenance: record.provenance,
+            bytes,
+        }))
+    }
+}
+
+fn derived_key(revision: u64, name: &str) -> Result<String> {
+    if name.trim().is_empty() || name.contains('\0') {
+        return Err(Error::InvalidDerived(
+            "name must be nonempty and contain no NUL",
+        ));
+    }
+    // The length prefix keeps names containing '/' distinct from chunk suffixes.
+    Ok(format!("r/{revision}/{}:{name}", name.len()))
 }
 
 struct Prepared {
