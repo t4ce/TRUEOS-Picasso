@@ -7,7 +7,16 @@
 use alloc::vec::Vec;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 
-const ASSETS: TableDefinition<&str, &[u8]> = TableDefinition::new("picasso_runtime_assets_v1");
+const ASSET_LENGTHS: TableDefinition<&str, u64> =
+    TableDefinition::new("picasso_runtime_asset_lengths_v2");
+const ASSET_CHUNKS: TableDefinition<(&str, u64), &[u8]> =
+    TableDefinition::new("picasso_runtime_asset_chunks_v2");
+// Leave room for keys and page headers inside a 64 KiB redb page. A whole
+// 40 MiB image value otherwise needs a 64 MiB page and larger backend growth.
+const RUNTIME_CHUNK_BYTES: usize = 60 * 1024;
+// The backend already owns every byte in RAM. Keep only a small working cache
+// instead of redb's 1 GiB disk-oriented default, especially for image bundles.
+const RUNTIME_CACHE_BYTES: usize = 1024 * 1024;
 
 /// Failures exposed by Picasso's runtime asset boundary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,6 +73,7 @@ struct RuntimeAssetDatabase {
 impl RuntimeAssetDatabase {
     fn new() -> Result<Self, PicassoError> {
         let database = Database::builder()
+            .set_cache_size(RUNTIME_CACHE_BYTES)
             .create_with_backend(redb::backends::InMemoryBackend::new())
             .map_err(|_| PicassoError::Storage)?;
         Ok(Self { database })
@@ -76,11 +86,31 @@ impl RuntimeAssetDatabase {
             .begin_write()
             .map_err(|_| PicassoError::Storage)?;
         {
-            let mut assets = write
-                .open_table(ASSETS)
+            let mut lengths = write
+                .open_table(ASSET_LENGTHS)
                 .map_err(|_| PicassoError::Storage)?;
-            assets
-                .insert(name, bytes)
+            let previous_length = lengths
+                .get(name)
+                .map_err(|_| PicassoError::Storage)?
+                .map(|entry| entry.value())
+                .unwrap_or(0);
+            let mut chunks = write
+                .open_table(ASSET_CHUNKS)
+                .map_err(|_| PicassoError::Storage)?;
+            for (index, chunk) in bytes.chunks(RUNTIME_CHUNK_BYTES).enumerate() {
+                chunks
+                    .insert((name, index as u64), chunk)
+                    .map_err(|_| PicassoError::Storage)?;
+            }
+            for index in (bytes.len() as u64).div_ceil(RUNTIME_CHUNK_BYTES as u64)
+                ..previous_length.div_ceil(RUNTIME_CHUNK_BYTES as u64)
+            {
+                chunks
+                    .remove((name, index))
+                    .map_err(|_| PicassoError::Storage)?;
+            }
+            lengths
+                .insert(name, bytes.len() as u64)
                 .map_err(|_| PicassoError::Storage)?;
         }
         write.commit().map_err(|_| PicassoError::Storage)
@@ -92,15 +122,33 @@ impl RuntimeAssetDatabase {
             .database
             .begin_read()
             .map_err(|_| PicassoError::Storage)?;
-        let assets = match read.open_table(ASSETS) {
+        let lengths = match read.open_table(ASSET_LENGTHS) {
             Ok(assets) => assets,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
             Err(_) => return Err(PicassoError::Storage),
         };
-        assets
-            .get(name)
-            .map(|stored| stored.map(|value| value.value().to_vec()))
-            .map_err(|_| PicassoError::Storage)
+        let Some(length) = lengths.get(name).map_err(|_| PicassoError::Storage)? else {
+            return Ok(None);
+        };
+        let length = usize::try_from(length.value()).map_err(|_| PicassoError::Storage)?;
+        let chunks = read
+            .open_table(ASSET_CHUNKS)
+            .map_err(|_| PicassoError::Storage)?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(length)
+            .map_err(|_| PicassoError::Storage)?;
+        for index in 0..length.div_ceil(RUNTIME_CHUNK_BYTES) {
+            let chunk = chunks
+                .get((name, index as u64))
+                .map_err(|_| PicassoError::Storage)?
+                .ok_or(PicassoError::Storage)?;
+            if chunk.value().len() != (length - bytes.len()).min(RUNTIME_CHUNK_BYTES) {
+                return Err(PicassoError::Storage);
+            }
+            bytes.extend_from_slice(chunk.value());
+        }
+        Ok(Some(bytes))
     }
 }
 
@@ -162,5 +210,42 @@ mod tests {
             picasso.embedded_asset(""),
             Err(PicassoError::EmptyAssetName)
         );
+    }
+
+    #[test]
+    fn assets_larger_than_the_cache_survive_independent_reads_and_replacement() {
+        let picasso = Picasso::new().unwrap();
+        let large = alloc::vec![0x5a; 3 * RUNTIME_CACHE_BYTES + 17];
+        picasso.put_embedded_asset("large", &large).unwrap();
+        picasso.put_embedded_asset("other", b"keep").unwrap();
+        let retained = picasso.embedded_asset("large").unwrap().unwrap();
+        picasso.put_embedded_asset("large", b"replacement").unwrap();
+        assert_eq!(retained, large);
+        assert_eq!(picasso.embedded_asset("other").unwrap().unwrap(), b"keep");
+        assert_eq!(
+            picasso.embedded_asset("large").unwrap().unwrap(),
+            b"replacement"
+        );
+    }
+
+    #[test]
+    fn chunked_replacement_releases_tail_and_preserves_empty_assets() {
+        let picasso = Picasso::new().unwrap();
+        let bytes = alloc::vec![0x35; 2 * RUNTIME_CHUNK_BYTES + 1];
+        picasso.put_embedded_asset("image", &bytes).unwrap();
+        picasso
+            .put_embedded_asset("image/0", b"independent")
+            .unwrap();
+        picasso.put_embedded_asset("image", b"").unwrap();
+        assert_eq!(picasso.embedded_asset("image").unwrap(), Some(Vec::new()));
+        assert_eq!(
+            picasso.embedded_asset("image/0").unwrap().unwrap(),
+            b"independent"
+        );
+        let read = picasso.assets.database.begin_read().unwrap();
+        let chunks = read.open_table(ASSET_CHUNKS).unwrap();
+        for index in 0..3 {
+            assert!(chunks.get(("image", index)).unwrap().is_none());
+        }
     }
 }
