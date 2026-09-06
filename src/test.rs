@@ -139,6 +139,29 @@ mod cam_tests {
             "cursor-right must remain visual-right after camera roll"
         );
     }
+
+    #[cfg(feature = "blueprint")]
+    #[test]
+    fn retained_camera_uses_the_camera_projection_and_history() {
+        let mut camera = camera();
+        camera.position = [1.0, 2.0, 3.0];
+        camera.projection = Projection::Orthographic {
+            xmag: 4.0,
+            ymag: 2.0,
+            znear: 0.5,
+            zfar: 50.0,
+        };
+        let history = [7.0; 16];
+
+        let retained = camera.retained(800, 600, history);
+
+        assert_eq!(retained.position_near, [1.0, 2.0, 3.0, 0.5]);
+        assert_eq!(retained.forward_far, [0.0, 0.0, -1.0, 50.0]);
+        assert_eq!(retained.projection[0], 0.5);
+        assert_eq!(retained.projection[5], 1.0);
+        assert_eq!(retained.previous_view_projection, history);
+        assert_eq!(retained.inverse_view_projection[15], 1.0);
+    }
 }
 
 mod cubism_tests {

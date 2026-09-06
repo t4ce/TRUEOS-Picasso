@@ -88,6 +88,181 @@ pub struct Camera {
     pub projection: Projection,
 }
 
+impl Camera {
+    /// Builds the camera block consumed by TRUEOS's retained renderer.
+    ///
+    /// `width` and `height` are the current target dimensions. Pass the
+    /// preceding frame's `view_projection` to support retained-frame motion
+    /// history; `[0.0; 16]` is appropriate for the first frame.
+    #[cfg(feature = "blueprint")]
+    pub fn retained(
+        self,
+        width: u32,
+        height: u32,
+        previous_view_projection: [f32; 16],
+    ) -> trueos_bp::vgpu::RetainedCamera {
+        let [qx, qy, qz, qw] = self.rotation.normalized().0;
+        let world_to_view = Quaternion([-qx, -qy, -qz, qw]);
+        let x = world_to_view.rotate([1.0, 0.0, 0.0]);
+        let y = world_to_view.rotate([0.0, 1.0, 0.0]);
+        let z = world_to_view.rotate([0.0, 0.0, 1.0]);
+        let translation =
+            world_to_view.rotate([-self.position[0], -self.position[1], -self.position[2]]);
+        let view = [
+            x[0],
+            x[1],
+            x[2],
+            0.0,
+            y[0],
+            y[1],
+            y[2],
+            0.0,
+            z[0],
+            z[1],
+            z[2],
+            0.0,
+            translation[0],
+            translation[1],
+            translation[2],
+            1.0,
+        ];
+        let aspect = width as f32 / height.max(1) as f32;
+        let (projection, znear, zfar) = match self.projection {
+            Projection::Perspective {
+                yfov, znear, zfar, ..
+            } => {
+                let zfar = zfar.unwrap_or(f32::MAX);
+                let focal_y = 1.0 / libm::tanf(yfov * 0.5);
+                (
+                    [
+                        focal_y / aspect,
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        focal_y,
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        zfar / (znear - zfar),
+                        -1.0,
+                        0.0,
+                        0.0,
+                        zfar * znear / (znear - zfar),
+                        0.0,
+                    ],
+                    znear,
+                    zfar,
+                )
+            }
+            Projection::Orthographic {
+                xmag,
+                ymag,
+                znear,
+                zfar,
+            } => (
+                [
+                    2.0 / xmag,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    2.0 / ymag,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0 / (znear - zfar),
+                    0.0,
+                    0.0,
+                    0.0,
+                    znear / (znear - zfar),
+                    1.0,
+                ],
+                znear,
+                zfar,
+            ),
+        };
+        let view_projection = multiply_mat4(projection, view);
+        trueos_bp::vgpu::RetainedCamera {
+            view,
+            projection,
+            view_projection,
+            inverse_view_projection: invert_mat4(view_projection).unwrap_or(identity_mat4()),
+            position_near: [self.position[0], self.position[1], self.position[2], znear],
+            forward_far: {
+                let forward = self.rotation.rotate([0.0, 0.0, -1.0]);
+                [forward[0], forward[1], forward[2], zfar]
+            },
+            jitter_frame: [0.0; 4],
+            previous_view_projection,
+        }
+    }
+}
+
+#[cfg(feature = "blueprint")]
+fn multiply_mat4(left: [f32; 16], right: [f32; 16]) -> [f32; 16] {
+    let mut output = [0.0; 16];
+    for column in 0..4 {
+        for row in 0..4 {
+            output[column * 4 + row] = (0..4)
+                .map(|inner| left[inner * 4 + row] * right[column * 4 + inner])
+                .sum();
+        }
+    }
+    output
+}
+
+#[cfg(feature = "blueprint")]
+fn invert_mat4(matrix: [f32; 16]) -> Option<[f32; 16]> {
+    let mut augmented = [[0.0; 8]; 4];
+    for row in 0..4 {
+        for column in 0..4 {
+            augmented[row][column] = matrix[column * 4 + row];
+            augmented[row][column + 4] = if row == column { 1.0 } else { 0.0 };
+        }
+    }
+    for pivot_column in 0..4 {
+        let mut pivot_row = pivot_column;
+        for candidate in pivot_column + 1..4 {
+            if libm::fabsf(augmented[candidate][pivot_column])
+                > libm::fabsf(augmented[pivot_row][pivot_column])
+            {
+                pivot_row = candidate;
+            }
+        }
+        let pivot = augmented[pivot_row][pivot_column];
+        if libm::fabsf(pivot) <= f32::EPSILON {
+            return None;
+        }
+        augmented.swap(pivot_column, pivot_row);
+        for value in &mut augmented[pivot_column] {
+            *value /= pivot;
+        }
+        for row in 0..4 {
+            if row != pivot_column {
+                let factor = augmented[row][pivot_column];
+                for column in 0..8 {
+                    augmented[row][column] -= factor * augmented[pivot_column][column];
+                }
+            }
+        }
+    }
+    Some(core::array::from_fn(|index| {
+        let row = index % 4;
+        let column = index / 4;
+        augmented[row][column + 4]
+    }))
+}
+
+#[cfg(feature = "blueprint")]
+const fn identity_mat4() -> [f32; 16] {
+    [
+        1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+    ]
+}
+
 /// Current state of the four movement keys.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Wasd {
