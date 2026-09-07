@@ -140,6 +140,40 @@ mod cam_tests {
         );
     }
 
+    #[test]
+    fn q_e_roll_about_the_view_axis_and_cancel() {
+        let mut fly = FlyCam::new(camera(), 1.0);
+        let forward = fly.camera.rotation.rotate([0.0, 0.0, -1.0]);
+
+        fly.step(
+            Wasd {
+                q: true,
+                ..Wasd::default()
+            },
+            1.0,
+        );
+        let rolled_forward = fly.camera.rotation.rotate([0.0, 0.0, -1.0]);
+        let rolled_up = fly.camera.rotation.rotate([0.0, 1.0, 0.0]);
+        for axis in 0..3 {
+            assert!((rolled_forward[axis] - forward[axis]).abs() < 1.0e-5);
+        }
+        assert!(
+            rolled_up[0] < 0.0,
+            "Q must roll visual-up toward visual-left"
+        );
+
+        fly.step(
+            Wasd {
+                e: true,
+                ..Wasd::default()
+            },
+            1.0,
+        );
+        let restored_up = fly.camera.rotation.rotate([0.0, 1.0, 0.0]);
+        assert!((restored_up[0]).abs() < 1.0e-5);
+        assert!((restored_up[1] - 1.0).abs() < 1.0e-5);
+    }
+
     #[cfg(feature = "blueprint")]
     #[test]
     fn retained_camera_uses_the_camera_projection_and_history() {

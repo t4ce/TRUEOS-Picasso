@@ -1,7 +1,7 @@
 //! Renderer-neutral camera data and a tiny quaternion fly-camera controller.
 //!
 //! Input backends keep ownership of key and pointer events. Feed their current
-//! WASD state to [`FlyCam::step`] and pointer deltas to [`FlyCam::look`].
+//! WASD/QE state to [`FlyCam::step`] and pointer deltas to [`FlyCam::look`].
 //!
 //! Blueprint applications can use [`FlyCam::step_ui4`] together with
 //! [`FlyCam::handle_ui4_pointer_event`]. UI4 remains the owner of physical
@@ -263,14 +263,21 @@ const fn identity_mat4() -> [f32; 16] {
     ]
 }
 
-/// Current state of the four movement keys.
+/// Current state of the default fly-camera keys: WASD moves and Q/E rolls.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Wasd {
     pub w: bool,
     pub a: bool,
     pub s: bool,
     pub d: bool,
+    /// Roll visual-up toward visual-left around the camera's view axis.
+    pub q: bool,
+    /// Roll visual-up toward visual-right around the camera's view axis.
+    pub e: bool,
 }
+
+/// Default Q/E roll rate for [`FlyCam::step`], in radians per second.
+pub const DEFAULT_ROLL_RADIANS_PER_SECOND: f32 = 1.5;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FlyCam {
@@ -310,6 +317,8 @@ impl FlyCam {
                     a: false,
                     s: false,
                     d: false,
+                    q: false,
+                    e: false,
                 },
                 route: None,
                 last_combo: 0,
@@ -342,13 +351,27 @@ impl FlyCam {
         self.camera.rotation = (self.camera.rotation * yaw * pitch).normalized();
     }
 
-    /// Moves in camera-local X/Z. Opposing keys cancel and diagonals are
-    /// normalized so they are not faster than movement along one axis.
+    /// Roll around the camera-local view axis. A positive angle moves visual
+    /// up toward visual left, and never changes the forward direction.
+    pub fn roll(&mut self, angle_radians: f32) {
+        let local_view_axis = Quaternion::from_axis_angle([0.0, 0.0, 1.0], angle_radians);
+        self.camera.rotation = (self.camera.rotation * local_view_axis).normalized();
+    }
+
+    /// Moves in camera-local X/Z and rolls around the view axis. Opposing
+    /// movement or roll keys cancel; diagonal movement remains normalized.
     pub fn step(&mut self, keys: Wasd, delta_seconds: f32) {
+        if delta_seconds <= 0.0 {
+            return;
+        }
+        let roll = (keys.q as i8 - keys.e as i8) as f32;
+        if roll != 0.0 {
+            self.roll(roll * DEFAULT_ROLL_RADIANS_PER_SECOND * delta_seconds);
+        }
         let x = (keys.d as u8 as f32) - (keys.a as u8 as f32);
         let z = (keys.s as u8 as f32) - (keys.w as u8 as f32);
         let length = libm::sqrtf(x * x + z * z);
-        if length <= f32::EPSILON || delta_seconds <= 0.0 {
+        if length <= f32::EPSILON {
             return;
         }
         let movement = self.camera.rotation.rotate([x / length, 0.0, z / length]);
@@ -358,7 +381,8 @@ impl FlyCam {
         }
     }
 
-    /// Sample WASD from UI4's focused route. This never drains frame events.
+    /// Sample the default WASD/QE bindings from UI4's focused route. This
+    /// never drains frame events.
     #[cfg(feature = "blueprint")]
     pub fn step_ui4(
         &mut self,
@@ -431,21 +455,26 @@ impl FlyCam {
                 .find(|route| Ui4RouteIdentity::from(*route) == id)
                 .and_then(|route| route.keyboard)
         });
-        let keys = keyboard.map_or(Wasd::default(), wasd_from_keyboard);
+        let keys = keyboard.map_or(Wasd::default(), flycam_keys_from_keyboard);
         let changed = keys != self.ui4.last_keys;
         if changed {
             trueos_bp::logl::log(
                 trueos_bp::logl::level::DEBUG,
                 format_args!(
-                    "picasso flycam: UI4 WASD w={} a={} s={} d={}",
-                    keys.w as u8, keys.a as u8, keys.s as u8, keys.d as u8
+                    "picasso flycam: UI4 keys w={} a={} s={} d={} q={} e={}",
+                    keys.w as u8,
+                    keys.a as u8,
+                    keys.s as u8,
+                    keys.d as u8,
+                    keys.q as u8,
+                    keys.e as u8,
                 ),
             );
             self.ui4.last_keys = keys;
         }
         self.step(keys, delta_seconds);
         if changed {
-            self.log_ui4_pose("WASD");
+            self.log_ui4_pose("keys");
         }
         Ok(Ui4InputFrame {
             keys,
@@ -508,6 +537,8 @@ impl FlyCam {
 /// USB HID Keyboard/Keypad usages used by the default fly-camera binding.
 pub const HID_KEY_A: u8 = 0x04;
 pub const HID_KEY_D: u8 = 0x07;
+pub const HID_KEY_E: u8 = 0x08;
+pub const HID_KEY_Q: u8 = 0x14;
 pub const HID_KEY_S: u8 = 0x16;
 pub const HID_KEY_W: u8 = 0x1a;
 #[cfg(feature = "blueprint")]
@@ -539,12 +570,14 @@ fn ui4_keyboard_matches(
 }
 
 #[cfg(feature = "blueprint")]
-fn wasd_from_keyboard(keyboard: trueos_bp::ui4_scene::KeyboardState) -> Wasd {
+fn flycam_keys_from_keyboard(keyboard: trueos_bp::ui4_scene::KeyboardState) -> Wasd {
     Wasd {
         w: keyboard.is_down(HID_KEY_W),
         a: keyboard.is_down(HID_KEY_A),
         s: keyboard.is_down(HID_KEY_S),
         d: keyboard.is_down(HID_KEY_D),
+        q: keyboard.is_down(HID_KEY_Q),
+        e: keyboard.is_down(HID_KEY_E),
     }
 }
 
