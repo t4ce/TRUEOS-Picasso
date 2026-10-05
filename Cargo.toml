@@ -12,7 +12,7 @@ path = "src/lib.rs"
 default = ["host"]
 blueprint = ["dep:trueos_bp", "runtime-assets"]
 host = ["dep:base64", "dep:gltf", "dep:log_os_core", "dep:serde", "dep:serde_json", "redb/std", "runtime-assets"]
-runtime-assets = ["dep:redb"]
+runtime-assets = ["dep:redb", "dep:spin"]
 test-std = ["redb/std"]
 
 [dependencies]
@@ -20,7 +20,8 @@ base64 = { version = "0.22", optional = true }
 gltf = { version = "1.4.1", default-features = false, features = ["names", "utils"], optional = true }
 libm = "0.2"
 log_os_core = { package = "log-os", path = "../TRUEOS-Blueprints/crates/log-os", default-features = false, optional = true }
-redb = { version = "4.2.0", default-features = false, features = ["experimental-api-5"], optional = true }
+redb = { version = "=4.2.0", default-features = false, features = ["experimental-api-5"], optional = true }
+spin = { version = "0.10", default-features = false, features = ["rwlock"], optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 trueos_bp = { package = "trueos", path = "../TRUEOS-Blueprints/api", optional = true }

@@ -4,8 +4,16 @@
 //! creates one [`Picasso`], inserts its embedded assets, and keeps that owner
 //! alive for as long as those assets are needed.
 
-use alloc::vec::Vec;
+use alloc::{sync::Arc, vec::Vec};
+use redb::StorageBackend;
+#[cfg(any(feature = "host", feature = "test-std"))]
+extern crate std;
+#[cfg(not(any(feature = "host", feature = "test-std")))]
+use redb::io as backend_io;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use spin::RwLock;
+#[cfg(any(feature = "host", feature = "test-std"))]
+use std::io as backend_io;
 
 const ASSET_LENGTHS: TableDefinition<&str, u64> =
     TableDefinition::new("picasso_runtime_asset_lengths_v2");
@@ -51,6 +59,20 @@ impl Picasso {
         })
     }
 
+    /// Opens a prepared, cleanly closed database, taking ownership of its RAM
+    /// buffer. Asset bytes are not copied or re-inserted. This owner is read-only.
+    pub fn from_runtime_database_image(bytes: Vec<u8>) -> Result<Self, PicassoError> {
+        Ok(Self {
+            assets: RuntimeAssetDatabase::from_image(bytes)?,
+        })
+    }
+
+    /// Compact and close an ingestion database, returning its portable redb
+    /// image. The returned bytes can be compressed and opened by another owner.
+    pub fn into_runtime_database_image(self) -> Result<Vec<u8>, PicassoError> {
+        self.assets.into_image()
+    }
+
     /// Stores an embedded asset's bytes exactly under `name`.
     pub fn put_embedded_asset(&self, name: &str, bytes: &[u8]) -> Result<(), PicassoError> {
         self.assets.insert(name, bytes)
@@ -68,18 +90,131 @@ impl Picasso {
 
 struct RuntimeAssetDatabase {
     database: Database,
+    image: Arc<RwLock<Vec<u8>>>,
+    read_only: bool,
+}
+
+// The prepared image moves directly into this backend. redb may update its
+// bookkeeping header on open/close, but a prepared image never grows and the
+// public owner rejects asset writes. There is no filesystem backend.
+struct RamImageBackend {
+    image: Arc<RwLock<Vec<u8>>>,
+    growable: bool,
+}
+impl core::fmt::Debug for RamImageBackend {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("RamImageBackend")
+            .field("bytes", &self.image.read().len())
+            .finish()
+    }
+}
+impl StorageBackend for RamImageBackend {
+    fn len(&self) -> Result<u64, backend_io::Error> {
+        Ok(self.image.read().len() as u64)
+    }
+    fn read(&self, offset: u64, out: &mut [u8]) -> Result<(), backend_io::Error> {
+        let image = self.image.read();
+        let start = usize::try_from(offset)
+            .map_err(|_| backend_io::Error::other("RAM image offset overflow"))?;
+        let end = start
+            .checked_add(out.len())
+            .ok_or_else(|| backend_io::Error::other("RAM image range overflow"))?;
+        let bytes = image
+            .get(start..end)
+            .ok_or_else(|| backend_io::Error::other("RAM image read out of range"))?;
+        out.copy_from_slice(bytes);
+        Ok(())
+    }
+    fn set_len(&self, len: u64) -> Result<(), backend_io::Error> {
+        let len = usize::try_from(len)
+            .map_err(|_| backend_io::Error::other("RAM image size overflow"))?;
+        let mut image = self.image.write();
+        if !self.growable && image.len() != len {
+            return Err(backend_io::Error::other(
+                "prepared RAM image cannot be resized",
+            ));
+        }
+        if len > image.len() {
+            let extra = len - image.len();
+            image
+                .try_reserve(extra)
+                .map_err(|_| backend_io::Error::other("RAM image allocation failed"))?;
+        }
+        image.resize(len, 0);
+        Ok(())
+    }
+    fn sync_data(&self) -> Result<(), backend_io::Error> {
+        Ok(())
+    }
+    fn write(&self, offset: u64, bytes: &[u8]) -> Result<(), backend_io::Error> {
+        let mut image = self.image.write();
+        let start = usize::try_from(offset)
+            .map_err(|_| backend_io::Error::other("RAM image offset overflow"))?;
+        let end = start
+            .checked_add(bytes.len())
+            .ok_or_else(|| backend_io::Error::other("RAM image range overflow"))?;
+        image
+            .get_mut(start..end)
+            .ok_or_else(|| backend_io::Error::other("RAM image write out of range"))?
+            .copy_from_slice(bytes);
+        Ok(())
+    }
 }
 
 impl RuntimeAssetDatabase {
     fn new() -> Result<Self, PicassoError> {
+        Self::open_image(Vec::new(), false)
+    }
+
+    fn from_image(bytes: Vec<u8>) -> Result<Self, PicassoError> {
+        if bytes.is_empty() {
+            return Err(PicassoError::Storage);
+        }
+        let result = Self::open_image(bytes, true)?;
+        {
+            let read = result
+                .database
+                .begin_read()
+                .map_err(|_| PicassoError::Storage)?;
+            read.open_table(ASSET_LENGTHS)
+                .map_err(|_| PicassoError::Storage)?;
+            read.open_table(ASSET_CHUNKS)
+                .map_err(|_| PicassoError::Storage)?;
+        }
+        Ok(result)
+    }
+
+    fn open_image(bytes: Vec<u8>, read_only: bool) -> Result<Self, PicassoError> {
+        let image = Arc::new(RwLock::new(bytes));
         let database = Database::builder()
             .set_cache_size(RUNTIME_CACHE_BYTES)
-            .create_with_backend(redb::backends::InMemoryBackend::new())
+            .create_with_backend(RamImageBackend {
+                image: image.clone(),
+                growable: !read_only,
+            })
             .map_err(|_| PicassoError::Storage)?;
-        Ok(Self { database })
+        Ok(Self {
+            database,
+            image,
+            read_only,
+        })
+    }
+
+    fn into_image(mut self) -> Result<Vec<u8>, PicassoError> {
+        if self.read_only {
+            return Err(PicassoError::Storage);
+        }
+        self.database.compact().map_err(|_| PicassoError::Storage)?;
+        drop(self.database);
+        Arc::try_unwrap(self.image)
+            .map_err(|_| PicassoError::Storage)
+            .map(RwLock::into_inner)
     }
 
     fn insert(&self, name: &str, bytes: &[u8]) -> Result<(), PicassoError> {
+        if self.read_only {
+            return Err(PicassoError::Storage);
+        }
         validate_name(name)?;
         let write = self
             .database
@@ -163,6 +298,31 @@ fn validate_name(name: &str) -> Result<(), PicassoError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prepared_image_opens_without_copying_or_reinserting_assets() {
+        let source = Picasso::new().unwrap();
+        let bytes = alloc::vec![0x35; 3 * RUNTIME_CHUNK_BYTES + 17];
+        source.put_embedded_asset("image", &bytes).unwrap();
+        source.put_embedded_asset("empty", b"").unwrap();
+        let image = source.into_runtime_database_image().unwrap();
+        let original_buffer = image.as_ptr();
+        let owner = Picasso::from_runtime_database_image(image).unwrap();
+        assert_eq!(owner.assets.image.read().as_ptr(), original_buffer);
+        assert_eq!(owner.embedded_asset("image").unwrap().unwrap(), bytes);
+        assert_eq!(owner.embedded_asset("empty").unwrap().unwrap(), b"");
+        assert_eq!(owner.embedded_asset("missing").unwrap(), None);
+        assert_eq!(
+            owner.put_embedded_asset("image", b"replacement"),
+            Err(PicassoError::Storage)
+        );
+    }
+
+    #[test]
+    fn invalid_or_empty_prepared_images_are_rejected() {
+        assert!(Picasso::from_runtime_database_image(Vec::new()).is_err());
+        assert!(Picasso::from_runtime_database_image(alloc::vec![0; 8192]).is_err());
+    }
 
     #[test]
     fn stores_exact_bytes_without_a_file_backend() {
