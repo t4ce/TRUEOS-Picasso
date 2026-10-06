@@ -4,7 +4,7 @@
 //! creates one [`Picasso`], inserts its embedded assets, and keeps that owner
 //! alive for as long as those assets are needed.
 
-use alloc::{sync::Arc, vec::Vec};
+use alloc::{string::String, sync::Arc, vec::Vec};
 use redb::StorageBackend;
 #[cfg(any(feature = "host", feature = "test-std"))]
 extern crate std;
@@ -85,6 +85,66 @@ impl Picasso {
     /// Picasso continues serving the rest of the runtime asset catalog.
     pub fn embedded_asset(&self, name: &str) -> Result<Option<Vec<u8>>, PicassoError> {
         self.assets.get(name)
+    }
+
+    /// Copy the current committed RAM image into an independent writable owner.
+    /// This never changes the serving owner and performs no disk I/O.
+    pub fn fork_runtime_database(&self) -> Result<Self, PicassoError> {
+        Ok(Self {
+            assets: RuntimeAssetDatabase::open_image(self.assets.image.read().clone(), false)?,
+        })
+    }
+
+    pub fn embedded_asset_names(&self) -> Result<Vec<String>, PicassoError> {
+        let read = self
+            .assets
+            .database
+            .begin_read()
+            .map_err(|_| PicassoError::Storage)?;
+        let table = read
+            .open_table(ASSET_LENGTHS)
+            .map_err(|_| PicassoError::Storage)?;
+        table
+            .iter()
+            .map_err(|_| PicassoError::Storage)?
+            .map(|entry| {
+                entry
+                    .map(|(key, _)| String::from(key.value()))
+                    .map_err(|_| PicassoError::Storage)
+            })
+            .collect()
+    }
+
+    /// Remove the length record and every chunk in one transaction.
+    pub fn remove_embedded_asset(&self, name: &str) -> Result<(), PicassoError> {
+        if self.assets.read_only {
+            return Err(PicassoError::Storage);
+        }
+        validate_name(name)?;
+        let write = self
+            .assets
+            .database
+            .begin_write()
+            .map_err(|_| PicassoError::Storage)?;
+        {
+            let mut lengths = write
+                .open_table(ASSET_LENGTHS)
+                .map_err(|_| PicassoError::Storage)?;
+            let length = lengths
+                .remove(name)
+                .map_err(|_| PicassoError::Storage)?
+                .map(|v| v.value())
+                .unwrap_or(0);
+            let mut chunks = write
+                .open_table(ASSET_CHUNKS)
+                .map_err(|_| PicassoError::Storage)?;
+            for index in 0..length.div_ceil(RUNTIME_CHUNK_BYTES as u64) {
+                chunks
+                    .remove((name, index))
+                    .map_err(|_| PicassoError::Storage)?;
+            }
+        }
+        write.commit().map_err(|_| PicassoError::Storage)
     }
 }
 
@@ -298,6 +358,29 @@ fn validate_name(name: &str) -> Result<(), PicassoError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn writable_fork_prunes_chunks_without_changing_the_serving_image() {
+        let original = Picasso::new().unwrap();
+        original
+            .put_embedded_asset("gone", &alloc::vec![7; 180_000])
+            .unwrap();
+        original.put_embedded_asset("keep", b"before").unwrap();
+        let serving =
+            Picasso::from_runtime_database_image(original.into_runtime_database_image().unwrap())
+                .unwrap();
+        let fork = serving.fork_runtime_database().unwrap();
+        fork.remove_embedded_asset("gone").unwrap();
+        fork.put_embedded_asset("keep", b"after").unwrap();
+        assert_eq!(fork.embedded_asset_names().unwrap(), ["keep"]);
+        assert!(serving.embedded_asset("gone").unwrap().is_some());
+        assert_eq!(serving.embedded_asset("keep").unwrap().unwrap(), b"before");
+        let reopened =
+            Picasso::from_runtime_database_image(fork.into_runtime_database_image().unwrap())
+                .unwrap();
+        assert_eq!(reopened.embedded_asset("gone").unwrap(), None);
+        assert_eq!(reopened.embedded_asset("keep").unwrap().unwrap(), b"after");
+    }
 
     #[test]
     fn prepared_image_opens_without_copying_or_reinserting_assets() {
